@@ -34,10 +34,18 @@ pub struct ActiveWindowNiri {
     pub address: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ActiveWindowSway {
+    pub title: String,
+    pub class: String,
+    pub address: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActiveWindow {
     Hyprland(ActiveWindowHyprland),
     Niri(ActiveWindowNiri),
+    Sway(ActiveWindowSway),
 }
 
 impl ActiveWindow {
@@ -45,6 +53,7 @@ impl ActiveWindow {
         match self {
             ActiveWindow::Hyprland(w) => &w.title,
             ActiveWindow::Niri(w) => &w.title,
+            ActiveWindow::Sway(w) => &w.title,
         }
     }
 
@@ -52,6 +61,7 @@ impl ActiveWindow {
         match self {
             ActiveWindow::Hyprland(w) => &w.class,
             ActiveWindow::Niri(w) => &w.class,
+            ActiveWindow::Sway(w) => &w.class,
         }
     }
 
@@ -59,6 +69,7 @@ impl ActiveWindow {
         match self {
             ActiveWindow::Hyprland(w) => Ok(&w.initial_title),
             ActiveWindow::Niri(_) => Err("InitialTitle isn't supported on Niri"),
+            ActiveWindow::Sway(_) => Err("InitialTitle isn't supported on Sway"),
         }
     }
 
@@ -66,6 +77,7 @@ impl ActiveWindow {
         match self {
             ActiveWindow::Hyprland(w) => Ok(&w.initial_class),
             ActiveWindow::Niri(_) => Err("InitialClass isn't supported on Niri"),
+            ActiveWindow::Sway(_) => Err("InitialClass isn't supported on Sway"),
         }
     }
 }
@@ -84,6 +96,7 @@ pub struct CompositorState {
 pub enum CompositorChoice {
     Hyprland,
     Niri,
+    Sway,
 }
 
 #[derive(Debug, Clone)]

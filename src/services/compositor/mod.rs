@@ -1,5 +1,6 @@
 pub mod hyprland;
 pub mod niri;
+pub mod sway;
 pub mod types;
 
 pub use self::types::{
@@ -45,6 +46,7 @@ async fn broadcaster_event_loop(tx: broadcast::Sender<ServiceEvent<CompositorSer
     let result = match backend {
         CompositorChoice::Hyprland => hyprland::run_listener(&tx).await,
         CompositorChoice::Niri => niri::run_listener(&tx).await,
+        CompositorChoice::Sway => sway::run_listener(&tx).await,
     };
 
     if let Err(e) = result {
@@ -59,6 +61,8 @@ fn detect_backend() -> Option<CompositorChoice> {
             Some(CompositorChoice::Hyprland)
         } else if niri::is_available() {
             Some(CompositorChoice::Niri)
+        } else if sway::is_available() {
+            Some(CompositorChoice::Sway)
         } else {
             None
         }
@@ -147,6 +151,7 @@ async fn execute_command(
     match backend {
         CompositorChoice::Hyprland => hyprland::execute_command(command).await,
         CompositorChoice::Niri => niri::execute_command(command).await,
+        CompositorChoice::Sway => sway::execute_command(command).await,
     }
     .map_err(|e| e.to_string())
 }
