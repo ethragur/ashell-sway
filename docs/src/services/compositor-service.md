@@ -110,3 +110,10 @@ Uses the `niri-ipc` crate:
 - Connects to Niri's IPC socket (path from `NIRI_SOCKET` env var)
 - Listens for events and translates them to the common `CompositorEvent` format
 - Sends commands via the IPC protocol
+
+### Sway (`sway.rs`)
+Uses the `swayipc-async` 
+- Connects to the Sway IPC socket defined in the env var `SWAYSOCK`
+- Listen for events by subscribing to sway events
+- Sends commands via the Sway IPC
+
