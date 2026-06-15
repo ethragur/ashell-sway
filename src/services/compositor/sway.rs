@@ -63,7 +63,7 @@ pub async fn run_listener(
     tx: &broadcast::Sender<ServiceEvent<CompositorService>>,
 ) -> Result<()> {
     // Fix: conn must be mut since subscribe() takes &mut self
-    let mut conn = Connection::new().await?;
+    let conn = Connection::new().await?;
 
     let subs = [
         EventType::Workspace,
@@ -145,11 +145,10 @@ async fn fetch_full_state() -> Result<CompositorState> {
         .iter()
         .sorted_by_key(|w| w.num)
         .map(|w| {
-            let name = strip_workspace_name(&w.name);
             CompositorWorkspace {
                 id: w.num,
                 index: w.num,
-                name,
+                name: w.name.clone(),
                 monitor: w.output.clone(),
                 monitor_id: None,
                 windows: 0,
@@ -248,12 +247,4 @@ fn count_windows(node: &swayipc_async::Node) -> u16 {
     }
 
     count
-}
-
-fn strip_workspace_name(name: &str) -> String {
-    if let Some(pos) = name.find(": ") {
-        name[..pos].to_string()
-    } else {
-        name.to_string()
-    }
 }
