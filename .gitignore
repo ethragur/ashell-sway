@@ -18,3 +18,4 @@ vendor
 # mdbook build output
 docs/book/
 
+/result
