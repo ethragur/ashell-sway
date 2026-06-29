@@ -50,6 +50,8 @@ impl SystemBattery {
     pub async fn state(&self) -> DeviceState {
         let mut charging = false;
         let mut discharging = false;
+        let mut pending_charge = false;
+        let mut pending_discharge = false;
         let mut fully_charged_count = 0;
         let mut total_devices = 0;
 
@@ -68,6 +70,8 @@ impl SystemBattery {
                 match state {
                     DeviceState::Charging => charging = true,
                     DeviceState::Discharging => discharging = true,
+                    DeviceState::PendingCharge => pending_charge = true,
+                    DeviceState::PendingDischarge => pending_discharge = true,
                     DeviceState::FullyCharged => fully_charged_count += 1,
                     _ => {}
                 }
@@ -86,6 +90,10 @@ impl SystemBattery {
             DeviceState::Charging
         } else if discharging {
             DeviceState::Discharging
+        } else if pending_charge {
+            DeviceState::PendingCharge
+        } else if pending_discharge {
+            DeviceState::PendingDischarge
         } else {
             DeviceState::Unknown
         }
@@ -252,7 +260,12 @@ impl UpDeviceKind {
     pub fn is_peripheral(self) -> bool {
         matches!(
             self,
-            Self::Mouse | Self::Keyboard | Self::GamingInput | Self::Headset | Self::Headphones
+            Self::Mouse
+                | Self::Keyboard
+                | Self::GamingInput
+                | Self::Headset
+                | Self::Headphones
+                | Self::Touchpad
         )
     }
 

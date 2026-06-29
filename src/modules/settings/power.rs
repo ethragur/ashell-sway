@@ -39,6 +39,8 @@ fn format_time_for_battery(battery: &BatteryData) -> String {
                 format_duration(&duration)
             }
         }
+        BatteryStatus::NotCharging => format!("{}%", battery.capacity),
+        BatteryStatus::Unknown => String::new(),
         BatteryStatus::Full => "100%".to_string(),
     }
 }
@@ -474,9 +476,10 @@ impl PowerSettings {
             })
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn quick_setting_button<'a>(
         &'a self,
-    ) -> Option<(Element<'a, Message>, Option<Element<'a, Message>>)> {
+    ) -> Option<(Element<'a, Message>, Option<(bool, Element<'a, Message>)>)> {
         self.service.as_ref().and_then(|service| {
             if !matches!(service.power_profile, PowerProfile::Unknown) {
                 Some((
@@ -534,12 +537,17 @@ impl PowerSettings {
                 let status_label = match battery.status {
                     BatteryStatus::Charging(_) => t!("settings-power-status-charging"),
                     BatteryStatus::Discharging(_) => t!("settings-power-status-discharging"),
+                    BatteryStatus::NotCharging => t!("settings-power-status-not-charging"),
+                    BatteryStatus::Unknown => t!("settings-power-status-unknown"),
                     BatteryStatus::Full => t!("settings-power-status-full"),
                 };
-                let details = if battery.capacity < 95 {
-                    format_time_for_battery(&battery)
-                } else {
-                    String::new()
+                let details = match battery.status {
+                    BatteryStatus::Charging(_) | BatteryStatus::Discharging(_)
+                        if battery.capacity < 95 =>
+                    {
+                        format_time_for_battery(&battery)
+                    }
+                    _ => String::new(),
                 };
                 (capacity, status_label, details)
             })

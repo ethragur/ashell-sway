@@ -72,6 +72,8 @@ pub struct Outputs {
     /// Last toast input-region request, replayed once the toast's output is
     /// known (the enter event may arrive after the first layout).
     toast_region: Option<(iced::Size, config::ToastPosition)>,
+    toast_width: u32,
+    animations_enabled: bool,
 }
 
 pub enum HasOutput<'a> {
@@ -112,7 +114,13 @@ impl Outputs {
             toast: None,
             osd: None,
             toast_region: None,
+            toast_width: 0,
+            animations_enabled: false,
         }
+    }
+
+    fn make_menu(&self) -> Menu {
+        Menu::with_animations(self.animations_enabled)
     }
 
     pub fn get_height(style: AppearanceStyle, scale_factor: f64) -> f64 {
@@ -240,11 +248,12 @@ impl Outputs {
                 _ => Task::none(),
             };
 
+            let menu = self.make_menu();
             self.entries.push((
                 name.to_owned(),
                 Some(ShellInfo {
                     id,
-                    menu: Menu::new(),
+                    menu,
                     position,
                     layer,
                     style,
@@ -326,11 +335,12 @@ impl Outputs {
                     let (id, task) =
                         Self::create_output_layers(style, None, position, layer, scale_factor);
 
+                    let menu = self.make_menu();
                     self.entries.push((
                         "Fallback".to_string(),
                         Some(ShellInfo {
                             id,
-                            menu: Menu::new(),
+                            menu,
                             position,
                             layer,
                             style,
@@ -428,6 +438,7 @@ impl Outputs {
         }
 
         // Handle layer changes - only recreate surfaces when layer actually changes
+        let animations_enabled = self.animations_enabled;
         for (_name, shell_info, output_id) in &mut self.entries {
             if let Some(shell_info) = shell_info
                 && shell_info.layer != layer
@@ -439,7 +450,7 @@ impl Outputs {
                     Self::create_output_layers(style, *output_id, position, layer, scale_factor);
 
                 shell_info.id = id;
-                shell_info.menu = Menu::new();
+                shell_info.menu = Menu::with_animations(animations_enabled);
                 shell_info.style = style;
                 shell_info.scale_factor = scale_factor;
 
@@ -500,13 +511,38 @@ impl Outputs {
             .any(|(_, shell_info, _)| shell_info.as_ref().is_some_and(|si| si.menu.is_open()))
     }
 
-    pub fn toggle_menu<Message: 'static>(
+    pub fn menu_is_closing(&self, id: SurfaceId) -> bool {
+        self.entries.iter().any(|(_, shell_info, _)| {
+            shell_info
+                .as_ref()
+                .is_some_and(|si| si.menu.surface_id() == Some(id) && si.menu.is_closing())
+        })
+    }
+
+    pub fn set_animations_enabled(&mut self, enabled: bool) {
+        self.animations_enabled = enabled;
+        for (_, shell_info, _) in self.entries.iter_mut() {
+            if let Some(si) = shell_info.as_mut() {
+                si.menu.set_animations_enabled(enabled);
+            }
+        }
+    }
+
+    pub fn finish_close_menu(&mut self, id: SurfaceId) -> Task<crate::app::Message> {
+        if let Some((_, Some(shell_info), _)) = self.find_by_surface_id_mut(id) {
+            shell_info.menu.finish_close()
+        } else {
+            Task::none()
+        }
+    }
+
+    pub fn toggle_menu(
         &mut self,
         id: SurfaceId,
         menu_type: MenuType,
         button_ui_ref: ButtonUIRef,
         request_keyboard: bool,
-    ) -> Task<Message> {
+    ) -> Task<crate::app::Message> {
         let task = match self.find_by_surface_id_mut(id) {
             Some((_, Some(shell_info), output_id)) => {
                 let output_id = *output_id;
@@ -554,11 +590,11 @@ impl Outputs {
     }
 
     /// Disable keyboard interactivity on all outputs if no menus remain open.
-    fn maybe_release_all_keyboards<Message: 'static>(
+    fn maybe_release_all_keyboards(
         &self,
-        task: Task<Message>,
+        task: Task<crate::app::Message>,
         esc_button_enabled: bool,
-    ) -> Task<Message> {
+    ) -> Task<crate::app::Message> {
         if esc_button_enabled && !self.menu_is_open() {
             let keyboard_tasks = self
                 .entries
@@ -575,12 +611,12 @@ impl Outputs {
         }
     }
 
-    pub fn close_menu<Message: 'static>(
+    pub fn close_menu(
         &mut self,
         id: SurfaceId,
         menu_type: Option<MenuType>,
         esc_button_enabled: bool,
-    ) -> Task<Message> {
+    ) -> Task<crate::app::Message> {
         let task = match self.find_by_surface_id_mut(id) {
             Some((_, Some(shell_info), _)) => match menu_type {
                 Some(mt) => shell_info.menu.close_if(mt),
@@ -592,11 +628,11 @@ impl Outputs {
         self.maybe_release_all_keyboards(task, esc_button_enabled)
     }
 
-    pub fn close_all_menu_if<Message: 'static>(
+    pub fn close_all_menu_if(
         &mut self,
         menu_type: MenuType,
         esc_button_enabled: bool,
-    ) -> Task<Message> {
+    ) -> Task<crate::app::Message> {
         let task = Task::batch(
             self.entries
                 .iter_mut()
@@ -611,7 +647,7 @@ impl Outputs {
         self.maybe_release_all_keyboards(task, esc_button_enabled)
     }
 
-    pub fn close_all_menus<Message: 'static>(&mut self, esc_button_enabled: bool) -> Task<Message> {
+    pub fn close_all_menus(&mut self, esc_button_enabled: bool) -> Task<crate::app::Message> {
         let task = Task::batch(
             self.entries
                 .iter_mut()
@@ -649,6 +685,8 @@ impl Outputs {
         width: u32,
         position: config::ToastPosition,
     ) -> Task<Message> {
+        self.toast_width = width;
+
         // Anchor both vertical edges so height 0 → full output height.
         let anchor = match position {
             config::ToastPosition::TopLeft | config::ToastPosition::BottomLeft => {
@@ -691,16 +729,24 @@ impl Outputs {
         self.toast_region = Some((content_size, position));
         let content_w = content_size.width.ceil() as i32;
         let content_h = content_size.height.ceil() as i32;
+        // The surface is wider than a card to leave slide runway, and content is
+        // aligned to the toast's horizontal edge, so the input region must follow.
+        let x = match position {
+            config::ToastPosition::TopLeft | config::ToastPosition::BottomLeft => 0,
+            config::ToastPosition::TopRight | config::ToastPosition::BottomRight => {
+                (self.toast_width as i32 - content_w).max(0)
+            }
+        };
         let y = match position {
             config::ToastPosition::TopLeft | config::ToastPosition::TopRight => 0,
             config::ToastPosition::BottomLeft | config::ToastPosition::BottomRight => self
-                .logical_height_for_output(toast.output)
+                .toast_usable_height(toast.output)
                 .map_or(0, |h| (h as i32) - content_h),
         };
         set_input_region(
             toast.id,
             Some(vec![InputRegionRect {
-                x: 0,
+                x,
                 y,
                 width: content_w,
                 height: content_h,
@@ -708,11 +754,18 @@ impl Outputs {
         )
     }
 
-    fn logical_height_for_output(&self, output_id: Option<OutputId>) -> Option<u32> {
+    /// Output height minus the bar's exclusive zone, which the toast surface
+    /// respects — so its usable height (for bottom-aligning) is shorter.
+    fn toast_usable_height(&self, output_id: Option<OutputId>) -> Option<u32> {
         let target = output_id?;
         self.entries.iter().find_map(|(_, info, oid)| {
             if *oid == Some(target) {
-                info.as_ref().and_then(|i| i.output_logical_height)
+                info.as_ref().and_then(|i| {
+                    i.output_logical_height.map(|h| {
+                        let bar = Self::get_height(i.style, i.scale_factor) as u32;
+                        h.saturating_sub(bar)
+                    })
+                })
             } else {
                 None
             }

@@ -33,10 +33,13 @@ To define a custom module, use the following fields:
 - `type` _(optional)_: Display type. Can be `Button` (clickable, default) or `Text` (display only).
 - `icon`: Icon displayed in the status bar (for `button` type).
 - `command`: Command to execute when the module is clicked (for `button` type). Empty or whitespace-only values are treated as unset.
-- `listen_cmd` _(optional)_: Command to run in the background to update the module’s display. Empty or whitespace-only values are treated as unset.
-- `icons` _(optional)_: Regex-to-icon mapping to change the icon based on the `listen_cmd` output (for `button` type`). The first matching regex wins; since the mappings are stored as a map, the evaluation order is not guaranteed. Prefer mutually exclusive regexes or keep patterns precise to avoid ambiguous matches.
-- `alert` _(optional)_: Regex to trigger a red alert dot on the icon when
-  matched in the `listen_cmd` output (for `button` type).
+- `on_right_click` _(optional)_: Command to execute on right-click.
+- `on_middle_click` _(optional)_: Command to execute on middle-click.
+- `on_scroll_up` _(optional)_: Command to execute when scrolling up over the module.
+- `on_scroll_down` _(optional)_: Command to execute when scrolling down over the module.
+- `listen_cmd` _(optional)_: Command to run in the background to update the module's display. Empty or whitespace-only values are treated as unset.
+- `icons` _(optional)_: Regex-to-icon mapping to change the icon based on the `listen_cmd` output (for `button` type). The first matching regex wins; since the mappings are stored as a map, the evaluation order is not guaranteed. Prefer mutually exclusive regexes or keep patterns precise to avoid ambiguous matches.
+- `alert` _(optional)_: Regex to trigger a red alert dot on the icon when matched in the `listen_cmd` output (for `button` type).
 
 ---
 
@@ -64,26 +67,22 @@ The `listen_cmd` should output JSON in
 the [Waybar format](https://github.com/Alexays/Waybar/wiki/Module:-Custom#script-output),
 using `text` and `alt` fields.
 
-:::warning JSON must be compact (single-line)
+:::tip JSON Output
 
-The `listen_cmd` output is read line-by-line and each line is parsed as JSON.
-**Pretty-printed JSON will not work** because each line would be parsed separately.
+Output compact single-line JSON:
 
-Always output compact JSON, or pipe through `jq -c --unbuffered .` to compact it:
+```json
+{"text": "3", "alt": "notification"}
+```
+
+If you have pretty-printed JSON and want to use it in a single line, pipe it through `jq` to compact it:
 
 ```bash
 your-command | jq -c --unbuffered .
 ```
 
-For example, this pretty-printed JSON:
-```json
-{
-  "text": "3",
-  "alt": "notification"
-}
-```
+For example:
 
-Can be converted to compact format with:
 ```bash
 echo '{
   "text": "3",
@@ -92,9 +91,28 @@ echo '{
 # Output: {"text":"3","alt":"notification"}
 ```
 
+Or you can output pretty-printed multiline JSON directly, which is buffered until valid JSON is formed:
+
+```json
+{
+  "text": "3",
+  "alt": "notification"
+}
+```
+
+:::warning Multiline JSON Buffer Limit
+
+When using pretty-printed (multiline) JSON, output is accumulated in an internal buffer until a complete, parseable JSON object is received. As a safeguard against malformed output, for example a script that opens a `{` and never closes it, the buffer is capped at **1 MiB**. If that limit is exceeded, the buffered bytes are dropped, a warning is logged, and the buffer is cleared.
+
+This limit only applies while buffering multiline JSON. Single-line (compact) JSON output is unaffected since each line is parsed independently.
+
 :::
 
-### Example Output (compact JSON)
+See the configuration examples below for multiline usage.
+
+:::
+
+### Example Output
 
 ```json
 {"text": "3", "alt": "notification"}
@@ -139,22 +157,33 @@ Text modules display only the text output from `listen_cmd` without any click ac
 [[CustomModule]]
 name = "MyClock"
 type = "Text"
-listen_cmd = "sh -c 'while true; do echo \"{\\\"text\\\": \\\"$(date +\"%H:%M\")\\\", \\\"alt\\\": \\\"\\\"}\"; sleep 1; done'"
+listen_cmd = '''
+while true; do
+  cat <<EOF
+{
+  "text": "$(date +'%H:%M')",
+  "alt": ""
+}
+EOF
+  sleep 1
+done
+'''
 ```
 
 ### Button Module with Icon (Interactive)
 
-Button modules display an icon and/or text with a click action:
+Button modules display an icon and/or text with a click action. They also support right-click, middle-click, and scroll events:
 
 ```toml
 [[CustomModule]]
-name = "CustomNotifications"
+name = "volume"
 type = "Button"
-icon = ""
-command = "swaync-client -t -sw"
-listen_cmd = "swaync-client -swb"
-icons.'dnd.*' = ""
-alert = ".*notification"
+icon = ""
+command = "pactl get-sink-volume @DEFAULT_SINK@"
+on_right_click = "pactl set-sink-mute @DEFAULT_SINK@ toggle"
+on_middle_click = "pavucontrol"
+on_scroll_up = "pactl set-sink-volume @DEFAULT_SINK@ +5%"
+on_scroll_down = "pactl set-sink-volume @DEFAULT_SINK@ -5%"
 ```
 
 ### Button Module with Icon Only
@@ -169,14 +198,19 @@ command = "walker"
 
 ### Button Module with Text Output
 
-Button modules can also display text output from `listen_cmd` with a click action:
+Button modules can display text from a multiline JSON output from `listen_cmd` with a click action:
 
 ```toml
 [[CustomModule]]
 name = "Clipboard"
 type = "Button"
+icon = "📋"
 command = "cliphist-rofi-img | wl-copy"
-listen_cmd = "echo '{\"text\": \"📋\", \"alt\": \"\"}'"
+listen_cmd = '''printf '%s\n' '{
+  "text": "Clipboard content",
+  "alt": ""
+}'
+'''
 ```
 
 ### Notifications (with wired)

@@ -3,13 +3,15 @@ use crate::{
     components::{
         divider, format_indicator,
         icons::{StaticIcon, icon, icon_button},
-        quick_setting_button, styled_button,
+        quick_setting_button,
+        spinning_icon::spinning_icon,
+        styled_button,
     },
     config::SettingsFormat,
     services::{
         ReadOnlyService, Service, ServiceEvent,
         network::{
-            AccessPoint, ActiveConnectionInfo, KnownConnection, NetworkCommand, NetworkEvent,
+            AccessPointData, ActiveConnectionInfo, KnownConnection, NetworkCommand, NetworkEvent,
             NetworkService, Vpn, dbus::ConnectivityState,
         },
     },
@@ -87,7 +89,7 @@ pub enum Message {
     ScanNearByWiFi,
     WiFiMore(SurfaceId),
     VpnMore(SurfaceId),
-    SelectAccessPoint(AccessPoint),
+    SelectAccessPoint(AccessPointData),
     RequestWiFiPassword(SurfaceId, String),
     ConfirmOpenNetwork(String),
     ToggleVpn(Vpn),
@@ -365,11 +367,12 @@ impl NetworkSettings {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn wifi_quick_setting_button<'a>(
         &'a self,
         id: SurfaceId,
         sub_menu: Option<SubMenu>,
-    ) -> Option<(Element<'a, Message>, Option<Element<'a, Message>>)> {
+    ) -> Option<(Element<'a, Message>, Option<(bool, Element<'a, Message>)>)> {
         self.service.as_ref().and_then(|service| {
             if service.wifi_present {
                 let active_connection = service.active_connections.iter().find_map(|c| match c {
@@ -393,17 +396,15 @@ impl NetworkSettings {
                             Message::ToggleWifiMenu,
                         )),
                     ),
-                    sub_menu
-                        .filter(|menu_type| *menu_type == SubMenu::Wifi)
-                        .map(|_| {
-                            Self::wifi_menu(
-                                service,
-                                id,
-                                active_connection
-                                    .map(|(name, strength, _)| (name.as_str(), *strength)),
-                                self.config.wifi_more_cmd.is_some(),
-                            )
-                        }),
+                    service.wifi_enabled.then_some((
+                        sub_menu == Some(SubMenu::Wifi),
+                        Self::wifi_menu(
+                            service,
+                            id,
+                            active_connection.map(|(name, strength, _)| (name.as_str(), *strength)),
+                            self.config.wifi_more_cmd.is_some(),
+                        ),
+                    )),
                 ))
             } else {
                 None
@@ -411,11 +412,12 @@ impl NetworkSettings {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn vpn_quick_setting_button<'a>(
         &'a self,
         id: SurfaceId,
         sub_menu: Option<SubMenu>,
-    ) -> Option<(Element<'a, Message>, Option<Element<'a, Message>>)> {
+    ) -> Option<(Element<'a, Message>, Option<(bool, Element<'a, Message>)>)> {
         self.service.as_ref().and_then(|service| {
             service
                 .known_connections
@@ -470,19 +472,19 @@ impl NetworkSettings {
                                 None
                             },
                         ),
-                        sub_menu
-                            .filter(|menu_type| *menu_type == SubMenu::Vpn)
-                            .map(|_| {
-                                Self::vpn_menu(service, id, self.config.vpn_more_cmd.is_some())
-                            }),
+                        Some((
+                            sub_menu == Some(SubMenu::Vpn),
+                            Self::vpn_menu(service, id, self.config.vpn_more_cmd.is_some()),
+                        )),
                     )
                 })
         })
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn airplane_mode_quick_setting_button<'a>(
         &'a self,
-    ) -> Option<(Element<'a, Message>, Option<Element<'a, Message>>)> {
+    ) -> Option<(Element<'a, Message>, Option<(bool, Element<'a, Message>)>)> {
         if self.config.remove_airplane_btn {
             None
         } else {
@@ -509,7 +511,8 @@ impl NetworkSettings {
         active_connection: Option<(&str, u8)>,
         show_more_button: bool,
     ) -> Element<'a, Message> {
-        let (space, font_size) = use_theme(|t| (t.space, t.font_size));
+        let (space, font_size, animated) =
+            use_theme(|t| (t.space, t.font_size, t.animations_enabled));
         let main = column!(
             row!(
                 text(t!("settings-network-nearby-wifi")).width(Length::Fill),
@@ -519,7 +522,16 @@ impl NetworkSettings {
                     String::new()
                 })
                 .size(font_size.sm),
-                icon_button(StaticIcon::Refresh).on_press(Message::ScanNearByWiFi)
+                if service.scanning_nearby_wifi {
+                    Element::from(
+                        container(spinning_icon(font_size.xs, animated))
+                            .padding((space.xl - font_size.xs) / 2.0),
+                    )
+                } else {
+                    icon_button(StaticIcon::Refresh)
+                        .on_press(Message::ScanNearByWiFi)
+                        .into()
+                }
             )
             .spacing(space.xs)
             .width(Length::Fill)
@@ -540,7 +552,7 @@ impl NetworkSettings {
                             let is_known = service.known_connections.iter().any(|c| {
                                 matches!(
                                     c,
-                                    KnownConnection::AccessPoint(AccessPoint { ssid, .. }) if ssid == &ac.ssid
+                                    KnownConnection::AccessPoint(AccessPointData { ssid, .. }) if ssid == &ac.ssid
                                 )
                             });
 

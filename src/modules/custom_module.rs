@@ -27,7 +27,7 @@ use tokio::{
 
 #[derive(Debug, Clone)]
 pub struct Custom {
-    config: CustomModuleDef,
+    pub config: CustomModuleDef,
     data: CustomListenData,
 }
 
@@ -40,6 +40,10 @@ pub struct CustomListenData {
 #[derive(Debug, Clone)]
 pub enum Message {
     LaunchCommand,
+    LaunchRightClickCommand,
+    LaunchMiddleClickCommand,
+    LaunchScrollUpCommand,
+    LaunchScrollDownCommand,
     Update(CustomListenData),
 }
 
@@ -86,6 +90,26 @@ impl Custom {
         match msg {
             Message::LaunchCommand => {
                 if let Some(cmd) = &self.config.command {
+                    execute_command(cmd);
+                }
+            }
+            Message::LaunchRightClickCommand => {
+                if let Some(cmd) = &self.config.on_right_click {
+                    execute_command(cmd);
+                }
+            }
+            Message::LaunchMiddleClickCommand => {
+                if let Some(cmd) = &self.config.on_middle_click {
+                    execute_command(cmd);
+                }
+            }
+            Message::LaunchScrollUpCommand => {
+                if let Some(cmd) = &self.config.on_scroll_up {
+                    execute_command(cmd);
+                }
+            }
+            Message::LaunchScrollDownCommand => {
+                if let Some(cmd) = &self.config.on_scroll_down {
                     execute_command(cmd);
                 }
             }
@@ -189,6 +213,7 @@ impl Custom {
                         Ok(mut child) => {
                             if let Some(stdout) = child.stdout.take() {
                                 let mut reader = BufReader::new(stdout).lines();
+                                let mut buf = String::new();
 
                                 // Ensure the child process is spawned in the runtime so it can
                                 // make progress on its own while we await for any output.
@@ -200,8 +225,11 @@ impl Custom {
                                 });
 
                                 while let Some(line) = reader.next_line().await.ok().flatten() {
-                                    match serde_json::from_str(&line) {
+                                    buf.push_str(&line);
+                                    buf.push('\n');
+                                    match serde_json::from_str::<CustomListenData>(&buf) {
                                         Ok(event) => {
+                                            buf.clear();
                                             if let Err(e) = output
                                                 .try_send((name.clone(), Message::Update(event)))
                                             {
@@ -210,10 +238,20 @@ impl Custom {
                                                 );
                                             }
                                         }
+                                        Err(e) if e.is_eof() => {
+                                            if buf.len() > 1 << 20 {
+                                                warn!(
+                                                    "custom module '{name}': dropping {} bytes of unterminated JSON",
+                                                    buf.len()
+                                                );
+                                                buf.clear();
+                                            }
+                                        }
                                         Err(e) => {
                                             error!(
-                                                "Failed to parse JSON for custom module '{name}': {e} (payload: {line})"
+                                                "Failed to parse JSON for custom module '{name}': {e} (payload: {buf})"
                                             );
+                                            buf.clear();
                                         }
                                     }
                                 }

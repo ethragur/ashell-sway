@@ -27,6 +27,7 @@ use crate::{
     theme::{AshellTheme, backdrop_color, darken_color, init_theme, use_theme},
 };
 use flexi_logger::LoggerHandle;
+use iced::futures::StreamExt;
 use iced::{
     Alignment, Color, Element, Gradient, Length, OutputEvent, Radians, Subscription, SurfaceId,
     Task, Theme,
@@ -79,6 +80,8 @@ pub enum Message {
     ConfigChanged(Box<Config>),
     ToggleMenu(MenuType, SurfaceId, ButtonUIRef),
     CloseMenu(SurfaceId),
+    /// Fired after a menu's close animation ends, to destroy its surface.
+    FinishCloseMenu(SurfaceId),
     Custom(String, custom_module::Message),
     Updates(modules::updates::Message),
     Workspaces(modules::workspaces::Message),
@@ -106,12 +109,13 @@ impl App {
         (logger, config, config_path): (LoggerHandle, Config, PathBuf),
     ) -> impl FnOnce() -> (Self, Task<Message>) {
         move || {
-            let outputs = Outputs::new(
+            let mut outputs = Outputs::new(
                 config.appearance.style,
                 config.position,
                 config.layer,
                 config.appearance.scale_factor,
             );
+            outputs.set_animations_enabled(config.animations.enabled);
 
             let custom = config
                 .custom_modules
@@ -127,7 +131,7 @@ impl App {
             ));
             init_localizer(resolve_localizer(&config));
 
-            let notifications = Notifications::new(config.notifications);
+            let notifications = Notifications::new(config.notifications, config.animations.enabled);
 
             (
                 App {
@@ -214,6 +218,10 @@ impl App {
             .update(modules::media_player::Message::ConfigReloaded(
                 config.media_player,
             ));
+        self.outputs
+            .set_animations_enabled(config.animations.enabled);
+        self.notifications
+            .set_animations_enabled(config.animations.enabled);
         let _ = self
             .notifications
             .update(modules::notifications::Message::ConfigReloaded(
@@ -386,6 +394,7 @@ impl App {
                 self.outputs
                     .close_menu(id, None, self.general_config.enable_esc_key)
             }
+            Message::FinishCloseMenu(id) => self.outputs.finish_close_menu(id),
             Message::Custom(name, msg) => {
                 if let Some(custom) = self.custom.get_mut(&name) {
                     custom.update(msg);
@@ -484,13 +493,9 @@ impl App {
                     info!("Output created: {info:?}");
                     let name = &format!("{} {} {}", info.name, info.make, info.model);
 
-                    if let Some((_, h)) = info.logical_size {
-                        self.outputs.set_output_logical_height(info.id, h as u32);
-                    }
-
                     let (bar_style, bar_position, scale_factor) =
                         use_theme(|t| (t.bar_style, t.bar_position, t.scale_factor));
-                    self.outputs.add(
+                    let task = self.outputs.add(
                         bar_style,
                         &self.general_config.outputs,
                         bar_position,
@@ -498,7 +503,14 @@ impl App {
                         name,
                         info.id,
                         scale_factor,
-                    )
+                    );
+
+                    // After add(), so the output's entry exists to attach the height to.
+                    if let Some((_, h)) = info.logical_size {
+                        self.outputs.set_output_logical_height(info.id, h as u32);
+                    }
+
+                    task
                 }
                 OutputEvent::Removed(output_id) => {
                     info!("Output destroyed");
@@ -549,7 +561,9 @@ impl App {
                 modules::notifications::Action::Task(task) => task.map(Message::Notifications),
                 modules::notifications::Action::Show(task) => {
                     let position = self.notifications.toast_position();
-                    let width = crate::components::MenuSize::Medium.size() as u32;
+                    // Double width gives the card a runway to fully exit on slide-out.
+                    let card_width = crate::components::MenuSize::Medium.size() as u32;
+                    let width = card_width * 2;
                     Task::batch(vec![
                         task.map(Message::Notifications),
                         self.outputs.show_toast_layer(width, position),
@@ -582,7 +596,12 @@ impl App {
                     IpcCommand::BrightnessDown { .. } => self.settings.brightness_adjust(false),
                     IpcCommand::ToggleAirplaneMode { .. } => self.settings.toggle_airplane(),
                     IpcCommand::ToggleIdleInhibitor { .. } => self.settings.toggle_idle_inhibitor(),
-                    IpcCommand::ToggleVisibility => unreachable!(),
+                    IpcCommand::ToggleVisibility => {
+                        warn!(
+                            "IpcCommand::ToggleVisibility reached IpcOsdCommand handler; use Message::ToggleVisibility instead"
+                        );
+                        modules::settings::Action::None
+                    }
                 };
                 if let settings::Action::Command(task) = action {
                     tasks.push(task.map(Message::Settings));
@@ -827,22 +846,19 @@ impl App {
                 }
                 _ => None,
             }),
-            Subscription::run(|| {
-                use iced::futures::StreamExt;
-                match signal_hook_tokio::Signals::new([libc::SIGUSR1]) {
-                    Ok(signals) => signals
-                        .filter_map(|sig| {
-                            if sig == libc::SIGUSR1 {
-                                iced::futures::future::ready(Some(Message::ToggleVisibility))
-                            } else {
-                                iced::futures::future::ready(None)
-                            }
-                        })
-                        .boxed(),
-                    Err(e) => {
-                        log::error!("Failed to create signal stream: {e}");
-                        iced::futures::stream::empty().boxed()
-                    }
+            Subscription::run(|| match signal_hook_tokio::Signals::new([libc::SIGUSR1]) {
+                Ok(signals) => signals
+                    .filter_map(|sig| {
+                        if sig == libc::SIGUSR1 {
+                            iced::futures::future::ready(Some(Message::ToggleVisibility))
+                        } else {
+                            iced::futures::future::ready(None)
+                        }
+                    })
+                    .boxed(),
+                Err(e) => {
+                    log::error!("Failed to create signal stream: {e}");
+                    iced::futures::stream::empty().boxed()
                 }
             }),
             // Always subscribe to audio/brightness services so OSD works

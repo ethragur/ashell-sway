@@ -413,7 +413,6 @@ impl Default for SystemInfoModuleConfig {
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum ToastPosition {
     TopLeft,
     #[default]
@@ -454,7 +453,6 @@ impl Default for NotificationsModuleConfig {
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum TrayClickAction {
     Open,
     Menu,
@@ -1172,6 +1170,18 @@ pub struct CustomModuleDef {
     /// Display type: Button (clickable) or Text (display only)
     #[serde(default)]
     pub r#type: CustomModuleType,
+    /// command to run on right-click
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub on_right_click: Option<String>,
+    /// command to run on middle-click
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub on_middle_click: Option<String>,
+    /// command to run on scroll up
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub on_scroll_up: Option<String>,
+    /// command to run on scroll down
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub on_scroll_down: Option<String>,
     // .. appearance etc
 }
 
