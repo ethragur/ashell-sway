@@ -50,6 +50,9 @@ group_by_monitor = true
 If you would like to make the special workspaces invisible, set the `disable_special_workspaces` to `true`.
 By default, special workspaces will be visible.
 
+Special workspaces are currently a Hyprland-only concept. On other compositors
+there are none to show, so this option has no effect.
+
 ## Workspace Filling And Maximum Workspaces
 
 You can also enable or disable filling the workspace  
@@ -119,17 +122,53 @@ enable_virtual_desktops = true
 
 ## Urgent Workspace Highlighting
 
-On Niri, when a window on a non-focused workspace requests attention, that
-workspace is highlighted with the danger palette color until you visit it.
-Hyprland support is not implemented yet.
+When a window on a non-focused workspace requests attention, that workspace is
+highlighted with the danger palette color until you visit it. This works on
+Niri and on generic Wayland compositors that report the workspace urgent state
+(`ext-workspace-v1`), as well as MangoWC. Hyprland does not report urgent states
+yet, so the highlight never triggers there.
 
 ## Workspace Scrolling Direction
 
-You can use the `invert_scroll_direction` field to choose whether to invert the scrolling direction for mice and trackpads:
+Scrolling over the workspace indicator switches workspace. By default, scrolling
+up goes to the *previous* workspace and scrolling down to the *next* one, for
+both mice and trackpads.
 
-- `All`: Enables both *Mouse* and *Trackpad* options below.
-- `Mouse`: Scrolling up will go to the next workspace and down will go to the previous one
-- `Trackpad`: Swiping up will go to the previous workspace and down will go to the next one
+Use the `invert_scroll_direction` field to invert that, independently per device
+kind (ashell distinguishes them by the kind of scroll event the compositor
+sends: discrete steps for a wheel, smooth deltas for a trackpad):
+
+- `All`: Inverts both the mouse wheel and the trackpad.
+- `Mouse`: Inverts the mouse wheel only. Scrolling up goes to the next workspace and down to the previous one.
+- `Trackpad`: Inverts the trackpad only. Swiping up goes to the next workspace and down to the previous one.
+
+## Window Icons
+
+By default the workspace indicator shows only the workspace name or number
+(`indicator_format = "Name"`). Set `indicator_format = "NameAndIcons"` to also
+show an icon for each application open in the workspace, similar to waybar's
+window-rewrite feature.
+
+Icons are resolved from each window's application class through the standard
+XDG icon lookup (icon theme plus `.desktop` files). When a class cannot be
+resolved a fallback glyph is shown instead. Window class collection is only
+performed while this option is enabled, so the default configuration adds no
+extra cost.
+
+```toml
+[workspaces]
+indicator_format = "NameAndIcons"
+```
+
+:::note
+
+Window class collection is currently implemented for Hyprland and Niri. On other
+compositors the indicator falls back to showing the name only.
+
+The icon index is built once at startup. Newly installed applications or a
+changed icon theme are picked up the next time `ashell` is restarted.
+
+:::
 
 ## Default Configuration
 
@@ -138,11 +177,23 @@ The default configuration is:
 ```toml
 [workspaces]
 visibility_mode = "All"
+indicator_format = "Name"
 group_by_monitor = false
 enable_workspace_filling = false
 disable_special_workspaces = false
-invert_scroll_direction = None
+enable_virtual_desktops = false
+workspace_names = []
+# max_workspaces is unset by default: omit the key to disable the limit
+# invert_scroll_direction is unset by default: omit the key to keep the
+# default scroll direction
 ```
+
+:::warning
+TOML has no `None` literal. Leave optional keys such as `max_workspaces` and
+`invert_scroll_direction` out of the file to keep their defaults. Writing
+`invert_scroll_direction = None` is a parse error that makes ashell fall back
+to the *entire* default config.
+:::
 
 ## Examples
 

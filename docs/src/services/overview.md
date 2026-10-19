@@ -6,18 +6,34 @@ Services are the backend layer of ashell. They manage communication with system 
 
 | Service | Location | Backend | Protocol | Required Package |
 |---------|----------|---------|----------|-----------------|
-| Compositor | `services/compositor/` | Hyprland / Niri | IPC socket | Hyprland or Niri |
+| Compositor | `services/compositor/` | Hyprland / Niri / MangoWC / generic Wayland | IPC socket / `mmsg` / Wayland protocols | Hyprland, Niri, MangoWC, or any Wayland compositor (generic fallback) |
 | Audio | `services/audio.rs` | PulseAudio | libpulse C library | PulseAudio or PipeWire-Pulse |
 | Brightness | `services/brightness.rs` | sysfs + logind | File I/O + D-Bus | systemd-logind |
-| Bluetooth | `services/bluetooth/` | BlueZ | D-Bus | `bluez` |
+| Bluetooth | `crates/ashell-services/src/bluetooth/` (iced glue in `services/bluetooth.rs`) | BlueZ | D-Bus | `bluez` |
 | Network | `services/network/` | NetworkManager / IWD | D-Bus | `networkmanager` or `iwd` |
 | MPRIS | `services/mpris/` | Media players | D-Bus | MPRIS-compatible player |
 | Tray | `services/tray/` | StatusNotifierItem | D-Bus | — |
 | UPower | `services/upower/` | UPower daemon | D-Bus | `upower` |
-| Privacy | `services/privacy.rs` | PipeWire | PipeWire portals | `pipewire` |
-| Idle Inhibitor | `services/idle_inhibitor.rs` | systemd-logind | D-Bus | systemd-logind |
+| Notifications | `services/notifications/` | Notification server | D-Bus | — |
+| Privacy | `services/privacy.rs` | PipeWire + `/dev/video0` | PipeWire registry + inotify | `pipewire` |
+| Idle Inhibitor | `services/idle_inhibitor.rs` | Wayland `idle-inhibit-unstable-v1` | Wayland protocol | — |
 | Logind | `services/logind.rs` | systemd-logind | D-Bus | systemd-logind |
 | Throttle | `services/throttle.rs` | (utility) | Stream adapter | — |
+| XDG Icons | `services/xdg_icons.rs` | (utility) | XDG icon theme | — |
+
+## Shared Icon Resolution
+
+`services/xdg_icons.rs` is a shared helper (not an event-producing service) used
+by both the tray and the workspaces module to turn an identifier into a
+displayable icon. Given a name it resolves an `XdgIcon` (`Image`, `Svg`, or a
+`NerdFont` glyph fallback) via the XDG icon theme, a fuzzy/prefix match against
+the installed icon set, and a `.desktop` `StartupWMClass` index.
+
+Each consumer keeps its own concern on top of this core: the tray handles raw
+D-Bus pixmaps, while the workspaces module lowercases the window class before
+lookup. Results are memoized in a process-wide cache, and the underlying indexes
+are built lazily; `warm_cache_async` pre-builds them off the UI thread when a
+consumer is active.
 
 ## Services vs. Modules
 

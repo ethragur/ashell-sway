@@ -1,13 +1,14 @@
 use crate::app::{self, App};
 use crate::components::{self, ButtonUIRef};
-use crate::config::{AppearanceStyle, Position};
-use crate::theme::{backdrop_color, use_theme};
+use crate::config::{BarSurface, Position, Surface};
+use crate::theme::{backdrop_color, surface_border, use_theme};
 use iced::alignment::Vertical;
 use iced::widget::container::Style;
 use iced::{
-    Anchor, Border, Element, KeyboardInteractivity, Layer, LayerShellSettings, Length, OutputId,
-    Padding, Pixels, SurfaceId, Task, Theme, destroy_layer_surface, new_layer_surface,
-    set_keyboard_interactivity, widget::container,
+    Anchor, Element, KeyboardInteractivity, Layer, LayerShellSettings, Length, OutputId, Padding,
+    Pixels, SurfaceId, Task, Theme, destroy_layer_surface, new_layer_surface,
+    set_keyboard_interactivity,
+    widget::{blur_container, container},
 };
 use std::time::Duration;
 
@@ -28,6 +29,7 @@ pub enum MenuType {
     VpnTooltip,
     BatteryTooltip,
     PeripheralBatteryTooltip(usize),
+    CustomTooltip(String),
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +204,7 @@ impl Menu {
                 | MenuType::VpnTooltip
                 | MenuType::BatteryTooltip
                 | MenuType::PeripheralBatteryTooltip(_)
+                | MenuType::CustomTooltip(_)
         );
         match &mut self.open {
             None => self.open(menu_type, button_ui_ref, request_keyboard, output_id),
@@ -222,6 +225,7 @@ impl Menu {
                         | MenuType::VpnTooltip
                         | MenuType::BatteryTooltip
                         | MenuType::PeripheralBatteryTooltip(_)
+                        | MenuType::CustomTooltip(_)
                 ) && menu_is_tooltip =>
             {
                 Task::none()
@@ -244,7 +248,9 @@ impl Menu {
 
     pub fn request_keyboard<Message: 'static>(&self) -> Task<Message> {
         if let Some(open) = &self.open {
-            set_keyboard_interactivity(open.id, KeyboardInteractivity::OnDemand)
+            // Exclusive grabs keyboard focus on Hyprland immediately, so keystrokes
+            // reach the dialog without requiring a mouse click first.
+            set_keyboard_interactivity(open.id, KeyboardInteractivity::Exclusive)
         } else {
             Task::none()
         }
@@ -298,65 +304,63 @@ impl App {
         content: Element<'a, app::Message>,
         button_ui_ref: ButtonUIRef,
     ) -> Element<'a, app::Message> {
-        let (space, menu_opacity, radius, bar_style, bar_position, menu_backdrop) =
-            use_theme(|t| {
-                (
-                    t.space,
-                    t.menu.opacity,
-                    t.radius,
-                    t.bar_style,
-                    t.bar_position,
-                    t.menu.backdrop,
-                )
-            });
+        let (space, radius, bar_surface, bar_position, menu_backdrop, blur) = use_theme(|t| {
+            (
+                t.space,
+                t.radius,
+                t.bar_surface,
+                t.bar_position,
+                t.menu.backdrop,
+                t.surface(Surface::Menu).blur,
+            )
+        });
 
-        components::MenuWrapper::new(
-            button_ui_ref.position.x,
+        let menu_style = move |theme: &Theme| Style {
+            background: Some(theme.palette().background.into()),
+            border: surface_border(theme, radius.lg),
+            ..Default::default()
+        };
+        let menu_body = if blur {
+            blur_container(content)
+                .padding(space.md)
+                .style(menu_style)
+                .width(Length::Shrink)
+                .into()
+        } else {
             container(content)
                 .padding(space.md)
-                .style(move |theme: &Theme| Style {
-                    background: Some(theme.palette().background.scale_alpha(menu_opacity).into()),
-                    border: Border {
-                        color: theme
-                            .extended_palette()
-                            .background
-                            .weakest
-                            .color
-                            .scale_alpha(menu_opacity),
-                        width: 1.,
-                        radius: radius.lg.into(),
-                    },
-                    ..Default::default()
-                })
+                .style(menu_style)
                 .width(Length::Shrink)
-                .into(),
-        )
-        .padding({
-            let v_padding = match bar_style {
-                AppearanceStyle::Solid | AppearanceStyle::Gradient => 2,
-                AppearanceStyle::Islands => 0,
-            };
+                .into()
+        };
 
-            Padding::new(0.)
-                .top(if bar_position == Position::Top {
-                    v_padding
-                } else {
-                    0
-                })
-                .bottom(if bar_position == Position::Bottom {
-                    v_padding
-                } else {
-                    0
-                })
-        })
-        .align_y(match bar_position {
-            Position::Top => Vertical::Top,
-            Position::Bottom => Vertical::Bottom,
-        })
-        .backdrop(backdrop_color(menu_backdrop))
-        .on_click_outside(app::Message::CloseMenu(id))
-        .open(!self.outputs.menu_is_closing(id))
-        .animated(use_theme(|t| t.animations_enabled))
-        .into()
+        components::MenuWrapper::new(button_ui_ref.position.x, menu_body)
+            .padding({
+                let v_padding = match bar_surface {
+                    BarSurface::Solid => 2,
+                    BarSurface::Transparent => 0,
+                };
+
+                Padding::new(0.)
+                    .top(if bar_position == Position::Top {
+                        v_padding
+                    } else {
+                        0
+                    })
+                    .bottom(if bar_position == Position::Bottom {
+                        v_padding
+                    } else {
+                        0
+                    })
+            })
+            .align_y(match bar_position {
+                Position::Top => Vertical::Top,
+                Position::Bottom => Vertical::Bottom,
+            })
+            .backdrop(backdrop_color(menu_backdrop))
+            .on_click_outside(app::Message::CloseMenu(id))
+            .open(!self.outputs.menu_is_closing(id))
+            .animated(use_theme(|t| t.animations_enabled))
+            .into()
     }
 }

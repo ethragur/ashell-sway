@@ -1,14 +1,17 @@
-use crate::config::{Position, get_config};
-use crate::outputs::Outputs;
+use crate::config::{LogTarget, get_config};
+use crate::outputs::{BarVisibility, Outputs};
+use crate::theme::BarLayout;
 use app::App;
 use clap::Parser;
 use flexi_logger::{
     Age, Cleanup, Criterion, FileSpec, LogSpecBuilder, LogSpecification, Logger, Naming,
 };
-use iced::{Anchor, Font, KeyboardInteractivity, Layer, LayerShellSettings};
-use log::{debug, error, warn};
+use iced::{
+    Font, KeyboardInteractivity, Layer, LayerShellSettings,
+    font::{Stretch as FontStretch, Style as FontStyle, Weight as FontWeight},
+};
+use log::{debug, error, info, warn};
 use std::backtrace::Backtrace;
-use std::env;
 use std::panic;
 use std::path::PathBuf;
 
@@ -29,14 +32,12 @@ const NERD_FONT: &[u8] = include_bytes!("../target/generated/SymbolsNerdFont-Reg
 const NERD_FONT_MONO: &[u8] =
     include_bytes!("../target/generated/SymbolsNerdFontMono-Regular-Subset.ttf");
 const CUSTOM_FONT: &[u8] = include_bytes!("../assets/AshellCustomIcon-Regular.otf");
-const HEIGHT: f64 = 34.;
+const HEIGHT: f64 = 26.;
 const TMP_FILE_SIZE: u64 = 10 * 1024 * 1024;
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
 
 #[derive(Parser, Debug)]
-#[command(
-    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")"),
-    about = env!("CARGO_PKG_DESCRIPTION")
-)]
+#[command(version = VERSION, about = env!("CARGO_PKG_DESCRIPTION"))]
 struct Args {
     #[arg(short, long, value_parser = clap::value_parser!(PathBuf))]
     config_path: Option<PathBuf>,
@@ -67,6 +68,123 @@ fn get_log_spec(log_level: &str) -> LogSpecification {
     }
 }
 
+fn fontdb_weight_to_iced(weight: fontdb::Weight) -> FontWeight {
+    // Map fontdb::Weight to iced::font::Weight.
+    // fontdb uses numeric values (100..=1000); iced uses named variants.
+    let numeric_weight = weight.0;
+    if numeric_weight <= 150 {
+        FontWeight::Thin
+    } else if numeric_weight <= 250 {
+        FontWeight::ExtraLight
+    } else if numeric_weight <= 350 {
+        FontWeight::Light
+    } else if numeric_weight <= 450 {
+        FontWeight::Normal
+    } else if numeric_weight <= 550 {
+        FontWeight::Medium
+    } else if numeric_weight <= 650 {
+        FontWeight::Semibold
+    } else if numeric_weight <= 750 {
+        FontWeight::Bold
+    } else if numeric_weight <= 850 {
+        FontWeight::ExtraBold
+    } else {
+        FontWeight::Black
+    }
+}
+
+fn fontdb_stretch_to_iced(stretch: fontdb::Stretch) -> FontStretch {
+    match stretch {
+        fontdb::Stretch::UltraCondensed => FontStretch::UltraCondensed,
+        fontdb::Stretch::ExtraCondensed => FontStretch::ExtraCondensed,
+        fontdb::Stretch::Condensed => FontStretch::Condensed,
+        fontdb::Stretch::SemiCondensed => FontStretch::SemiCondensed,
+        fontdb::Stretch::Normal => FontStretch::Normal,
+        fontdb::Stretch::SemiExpanded => FontStretch::SemiExpanded,
+        fontdb::Stretch::Expanded => FontStretch::Expanded,
+        fontdb::Stretch::ExtraExpanded => FontStretch::ExtraExpanded,
+        fontdb::Stretch::UltraExpanded => FontStretch::UltraExpanded,
+    }
+}
+
+// NOTE: workaround for iced-rs/iced#2847 — iced 0.14 doesn't expose face
+// selection, so cosmic-text's matcher can silently jump to another family
+// when the requested weight/stretch/style has no exact face. We pre-resolve
+// the real face here and pass its actual attributes so the matcher stays put.
+// Remove once iced exposes face selection. Loads the system font DB a second
+// time (cosmic-text already loads it internally); acceptable as a one-shot
+// startup cost paid only when `font_name` is set.
+fn resolve_font(name: &str, requested_weight: u16) -> Font {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+
+    // Find the best matching face for the requested weight with Normal
+    // style/stretch. cosmic-text's font matcher re-scores all faces and
+    // prefers a face whose weight/stretch/style are closest to the requested
+    // ones. So if the user asks for `Weight::Normal` (400) but the font only
+    // has a face with weight=500 (Medium), the matcher will prefer a different
+    // font with weight=400 — a silent fallback. To work around this, we detect
+    // the closest available face in the requested family and pass its actual
+    // weight to iced so the matcher's scoring keeps us on the right font.
+    let best_face = db
+        .faces()
+        .filter(|f| f.families.iter().any(|(fam, _)| fam == name))
+        .min_by_key(|f| {
+            // Score: prefer Normal style/stretch, then closest weight.
+            let style_penalty = if f.style == fontdb::Style::Normal {
+                0
+            } else {
+                100
+            };
+            let stretch_penalty = if f.stretch == fontdb::Stretch::Normal {
+                0
+            } else {
+                100
+            };
+            let weight_penalty = f.weight.0.abs_diff(requested_weight) / 10;
+            style_penalty + stretch_penalty + weight_penalty
+        });
+
+    let Some(face) = best_face else {
+        warn!("Font '{}' was not found in the system font database.", name);
+        warn!("  Use `fc-list` to list all available fonts and their exact family names.");
+        // fontdb indexes only the typographic family, so the per-weight names
+        // `fc-list` also prints (e.g. "Open Sans Light") never match here.
+        warn!(
+            "  Use the family shared by all weights (e.g. \"Open Sans\", not \"Open Sans Light\") \
+             and pick the weight with `font_weight`."
+        );
+        return Font::with_name(Box::leak(name.to_string().into_boxed_str()));
+    };
+
+    let weight = face.weight;
+    let iced_weight = fontdb_weight_to_iced(weight);
+
+    if weight.0 != requested_weight {
+        warn!(
+            "Font '{name}' has no face with weight={requested_weight} style=Normal. \
+             Using the closest available face (weight={}, style={:?}). \
+             Note: text rendered in a different weight (e.g. Bold) may look \
+             the same as regular text, since this font has no separate faces \
+             for those weights. Run `fc-list | grep -i {short_name}` to see \
+             all available faces of this font.",
+            weight.0,
+            face.style,
+            short_name = name.split_whitespace().next().unwrap_or(name),
+        );
+    }
+
+    Font {
+        family: iced::font::Family::Name(Box::leak(name.to_string().into_boxed_str())),
+        weight: iced_weight,
+        stretch: fontdb_stretch_to_iced(face.stretch),
+        style: match face.style {
+            fontdb::Style::Italic | fontdb::Style::Oblique => FontStyle::Italic,
+            fontdb::Style::Normal => FontStyle::Normal,
+        },
+    }
+}
+
 fn main() -> iced::Result {
     let args = Args::parse();
 
@@ -80,26 +198,42 @@ fn main() -> iced::Result {
 
     debug!("args: {args:?}");
 
-    let logdir = xdg::get_runtime_dir()
-        .unwrap_or_else(|| [env::temp_dir(), PathBuf::from("ashell")].iter().collect());
-    let logger = Logger::with(
-        LogSpecBuilder::new()
-            .default(log::LevelFilter::Info)
-            .build(),
-    )
-    .log_to_file(FileSpec::default().directory(logdir))
-    .rotate(
-        Criterion::AgeOrSize(Age::Day, TMP_FILE_SIZE),
-        Naming::Timestamps,
-        Cleanup::KeepLogFiles(7),
-    );
-    let logger = if cfg!(debug_assertions) {
-        logger.duplicate_to_stdout(flexi_logger::Duplicate::All)
-    } else {
-        logger
+    let log_prefs = config::read_logging_config(args.config_path.as_ref());
+
+    let log_spec = LogSpecBuilder::new()
+        .default(log::LevelFilter::Info)
+        .build();
+    let log_directory = match log_prefs.target {
+        LogTarget::File => log_prefs
+            .log_directory()
+            .inspect_err(|e| {
+                eprintln!("ashell: cannot use a log directory: {e:#}, logging to stderr")
+            })
+            .ok(),
+        LogTarget::Stdout | LogTarget::Stderr => None,
+    };
+    let logger = match &log_directory {
+        Some(directory) => {
+            let logger = Logger::with(log_spec)
+                .log_to_file(FileSpec::default().directory(directory))
+                .rotate(
+                    Criterion::AgeOrSize(Age::Day, TMP_FILE_SIZE),
+                    Naming::Timestamps,
+                    Cleanup::KeepLogFiles(7),
+                );
+            if cfg!(debug_assertions) {
+                logger.duplicate_to_stdout(flexi_logger::Duplicate::All)
+            } else {
+                logger
+            }
+        }
+        None if matches!(log_prefs.target, LogTarget::Stdout) => {
+            Logger::with(log_spec).log_to_stdout()
+        }
+        None => Logger::with(log_spec).log_to_stderr(),
     };
     let logger = logger.start().unwrap_or_else(|e| {
-        eprintln!("Failed to initialize file logger: {e}, falling back to stderr-only");
+        eprintln!("Failed to initialize logger: {e}, falling back to stderr-only");
         Logger::with(
             LogSpecBuilder::new()
                 .default(log::LevelFilter::Info)
@@ -113,21 +247,40 @@ fn main() -> iced::Result {
         error!("Panic: {info} \n {b}");
     }));
 
-    let (config, config_path) = get_config(args.config_path).unwrap_or_else(|err| {
+    info!("ashell {VERSION}");
+
+    if xdg::get_runtime_dir().is_none() {
+        warn!(
+            "XDG_RUNTIME_DIR is unset or invalid, ashell's runtime files fall back to {}",
+            xdg::fallback_dir().display()
+        );
+    }
+
+    let (config, config_path) = get_config(args.config_path.as_ref()).unwrap_or_else(|err| {
         error!("Failed to read config: {err}");
 
         std::process::exit(1);
     });
 
-    logger.set_new_spec(get_log_spec(&config.log_level));
+    logger.set_new_spec(get_log_spec(&config.logging.level));
 
     let font = if let Some(font_name) = &config.appearance.font_name {
-        Font::with_name(Box::leak(font_name.clone().into_boxed_str()))
+        resolve_font(font_name, config.appearance.font_weight.value())
     } else {
+        // The default family is cosmic-text's own pick, so a weight it has no
+        // exact face for would silently switch to another family.
+        if config.appearance.font_weight != config::FontWeight::Normal {
+            warn!("`font_weight` is ignored because `font_name` is not set.");
+        }
         Font::DEFAULT
     };
 
-    let height = Outputs::get_height(config.appearance.style, config.appearance.scale_factor);
+    let geometry = Outputs::bar_geometry(
+        BarLayout::from_appearance(&config.appearance.bar),
+        config.position,
+        config.appearance.scale_factor,
+        BarVisibility::Shown,
+    );
 
     let iced_layer = match config.layer {
         config::Layer::Top => Layer::Top,
@@ -141,14 +294,11 @@ fn main() -> iced::Result {
         App::view,
     )
     .layer_shell(LayerShellSettings {
-        anchor: match config.position {
-            Position::Top => Anchor::TOP,
-            Position::Bottom => Anchor::BOTTOM,
-        } | Anchor::LEFT
-            | Anchor::RIGHT,
+        anchor: geometry.anchor,
         layer: iced_layer,
-        exclusive_zone: height as i32,
-        size: Some((0, height as u32)),
+        exclusive_zone: geometry.exclusive_zone,
+        margin: geometry.margin,
+        size: Some(geometry.size),
         keyboard_interactivity: KeyboardInteractivity::None,
         namespace: "ashell-main-layer".into(),
         ..Default::default()

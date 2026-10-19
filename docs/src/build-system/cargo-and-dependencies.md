@@ -8,12 +8,13 @@ ashell's dependencies are managed in `Cargo.toml`. This chapter covers the key d
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `iced` (iced_layershell) | Git | GUI framework with Wayland layer shell support via [iced_layershell](https://github.com/MalpenZibo/iced_layershell) |
+| `iced` (iced_layershell) | Git (`v0.6.0`) | GUI framework with Wayland layer shell support via [iced_layershell](https://github.com/MalpenZibo/iced_layershell) |
 
 The dependency is aliased as `iced` in `Cargo.toml` (`package = "iced_layershell"`). It uses these features:
 - `tokio` — Async runtime integration
 - `advanced` — Custom widget support
 - `wgpu` — GPU-accelerated rendering
+- `tiny-skia` — Software rendering fallback
 - `image`, `svg`, `canvas` — Graphics capabilities
 
 ### Async Runtime
@@ -27,8 +28,8 @@ The dependency is aliased as `iced` in `Cargo.toml` (`package = "iced_layershell
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `hyprland` | 0.4.0-beta.2 | Hyprland IPC client |
-| `niri-ipc` | 25.11.0 | Niri IPC client |
+| `hyprland` | Git (`master`) | Hyprland IPC client |
+| `niri-ipc` | 26.4 | Niri IPC client |
 
 ### System Integration
 
@@ -36,22 +37,22 @@ The dependency is aliased as `iced` in `Cargo.toml` (`package = "iced_layershell
 |-------|---------|---------|
 | `zbus` | 5 | D-Bus client (BlueZ, NM, UPower, etc.) |
 | `libpulse-binding` | 2.28 | PulseAudio client library |
-| `pipewire` | 0.9 | PipeWire integration |
-| `wayland-client` | 0.31.12 | Wayland protocol client |
-| `wayland-protocols` | 0.32.10 | Wayland protocol definitions |
-| `sysinfo` | 0.37 | CPU, RAM, disk, network statistics |
+| `pipewire` | 0.10 | PipeWire integration |
+| `wayland-client` | 0.31 | Wayland protocol client |
+| `wayland-protocols` | 0.32 | Wayland protocol definitions |
+| `sysinfo` | 0.39 | CPU, RAM, disk, network statistics |
 | `udev` | 0.9 | Device monitoring |
 
 ### Configuration
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `toml` | 0.9 | TOML config file parsing |
+| `toml` | 1 | TOML config file parsing |
 | `serde` | 1.0 | Serialization/deserialization |
-| `serde_json` | 1 | JSON for tray menu data |
+| `serde_json` | 1 | JSON parsing (custom modules, compositor IPC, weather) |
 | `serde_with` | 3.12 | Advanced serde derivation |
 | `clap` | 4.5 | CLI argument parsing |
-| `inotify` | 0.11.0 | File change watching |
+| `inotify` | 0.11.1 | File change watching |
 
 ### Utilities
 
@@ -61,18 +62,16 @@ The dependency is aliased as `iced` in `Cargo.toml` (`package = "iced_layershell
 | `chrono-tz` | 0.10.4 | Timezone support |
 | `regex` | 1.12.2 | Regular expressions (config parsing) |
 | `hex_color` | 3 | Hex color parsing in config |
-| `itertools` | 0.14 | Iterator utilities |
+| `itertools` | 0.15 | Iterator utilities |
 | `anyhow` | 1 | Error handling |
 | `log` | 0.4 | Logging facade |
 | `flexi_logger` | 0.31 | Logging implementation |
 | `signal-hook` | 0.4.3 | Unix signal handling (SIGUSR1) |
-| `reqwest` | 0.13 | HTTP client (weather data) |
-| `uuid` | 1 | UUID generation |
+| `reqwest` | 0.13 | HTTP client (weather data, media artwork) |
 | `url` | 2.5.7 | URL parsing |
 | `freedesktop-icons` | 0.4 | XDG icon lookup |
 | `linicon-theme` | 1.2.0 | Icon theme resolution |
 | `shellexpand` | 3 | Tilde/env var expansion in paths |
-| `parking_lot` | 0.12.5 | Synchronization primitives |
 | `pin-project-lite` | 0.2.16 | Pin projection (for throttle stream) |
 | `libc` | 0.2.182 | System call interfaces |
 
@@ -80,7 +79,17 @@ The dependency is aliased as `iced` in `Cargo.toml` (`package = "iced_layershell
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `allsorts` | 0.15 | Font parsing and subsetting in `build.rs` |
+| `allsorts` | 0.17 | Font parsing and subsetting in `build.rs` |
+
+## Git Sources
+
+Three dependencies come from git instead of crates.io:
+
+- [`iced_layershell`](https://github.com/MalpenZibo/iced_layershell) (aliased as `iced`) — pinned to tag `v0.6.0`
+- [`hyprland`](https://github.com/hyprland-community/hyprland-rs) — tracks the `master` branch
+- [`softbuffer`](https://github.com/MalpenZibo/softbuffer) — replaced via `[patch.crates-io]` with a fork (branch `wayland-argb`) that uses `wl_shm` Argb8888, so the tiny-skia fallback renderer honors alpha on Wayland (upstream hardcodes Xrgb8888, which the compositor treats as fully opaque). The fork is based on v0.4.8 to match the `iced_tiny_skia` release `iced` depends on — rebasing it past 0.4.x will break the patch.
+
+`Cargo.lock` pins each source to an exact commit, so clones build reproducibly; only an explicit `cargo update -p <crate>` moves a branch-tracking dependency.
 
 ## Release Profile
 
@@ -99,11 +108,16 @@ For binary distribution, runtime dependencies are declared in `Cargo.toml` metad
 ```toml
 [package.metadata.nfpm]
 provides = ["ashell"]
-depends = ["libxkbcommon", "dbus"]
 
-[package.metadata.nfpm.deb]
-depends = ["libwayland-client0", "libpipewire-0.3-0t64", "libpulse0"]
+[package.metadata.nfpm.overrides.deb]
+depends = ["libxkbcommon0", "libwayland-client0", "libpipewire-0.3-0t64", "libpulse0", "libudev1", "dbus"]
 
-[package.metadata.nfpm.rpm]
-depends = ["libwayland-client", "pipewire-libs", "pulseaudio-libs"]
+[package.metadata.nfpm.overrides.rpm]
+depends = ["libxkbcommon", "libwayland-client", "pipewire-libs", "pulseaudio-libs", "systemd-libs", "dbus"]
 ```
+
+Dependencies go under `overrides` because package names differ per distro
+(`libxkbcommon0` on Debian/Ubuntu, `libxkbcommon` on Fedora). cargo-nfpm ignores
+`depends` in the plain `[package.metadata.nfpm.deb]` / `.rpm` tables. When adding
+a crate that links a new system library, add it to both lists. Check the result
+with `readelf -d target/release/ashell | grep NEEDED`.

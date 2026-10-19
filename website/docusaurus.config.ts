@@ -6,7 +6,7 @@ import type * as Preset from "@docusaurus/preset-classic";
 
 const config: Config = {
   title: "Ashell",
-  tagline: "A ready to go Wayland status bar for Hyprland and Niri",
+  tagline: "A ready to go status bar for Wayland compositors",
   favicon: "img/favicon.svg",
 
   // Future flags, see https://docusaurus.io/docs/api/docusaurus-config#future
@@ -62,7 +62,7 @@ const config: Config = {
         hashed: true,
         indexDocs: true,
         indexBlog: false,
-        indexPages: false,
+        indexPages: true,
         docsRouteBasePath: "/",
         searchBarShortcutHint: false,
       },
@@ -91,6 +91,11 @@ const config: Config = {
         {
           to: "gallery",
           label: "Gallery",
+          position: "left",
+        },
+        {
+          to: "changelog",
+          label: "Changelog",
           position: "left",
         },
         {
@@ -146,6 +151,10 @@ const config: Config = {
         {
           title: "More",
           items: [
+            {
+              label: "Changelog",
+              to: "/changelog",
+            },
             {
               label: "GitHub",
               href: "https://github.com/MalpenZibo/ashell",

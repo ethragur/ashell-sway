@@ -28,8 +28,21 @@ password-dialog-open-network-warning =
     "{ $ssid }" is an open network. Data sent over this connection may be visible to others.
     Do you want to connect anyway?
 password-dialog-insert-password = Insert password to connect to: { $ssid }
+password-dialog-connect-once = Connect only this time
 password-dialog-cancel = Cancel
 password-dialog-confirm = Confirm
+
+## Share Wi-Fi dialog
+share-wifi-title = Share Wi-Fi
+share-wifi-subtitle =
+    Scan this QR code with another device to join
+    "{ $ssid }"
+share-wifi-password-label = Wi-Fi password:
+share-wifi-password-open-network = Open network — no password required.
+share-wifi-password-unavailable-message = The password for this network is not readable, so it cannot be shared.
+share-wifi-unsupported-message = This network's authentication method cannot be shared via a QR code.
+share-wifi-error-message = Couldn't read the Wi-Fi password.
+share-wifi-close = Close
 
 ## OSD
 osd-airplane-toggle =
@@ -90,9 +103,18 @@ settings-power-status-discharging = Discharging
 settings-power-status-not-charging = Not charging
 settings-power-status-unknown = Unknown
 settings-power-status-full = Full
+settings-power-health = Health { $percentage }% ({ $energy_full } / { $energy_full_design } Wh)
+settings-power-charge-cycles =
+    { $count ->
+        [one] { $count } charge cycle
+       *[other] { $count } charge cycles
+    }
 
 ## Settings — idle inhibitor
 settings-idle-inhibitor = Idle Inhibitor
+
+## Settings — do not disturb
+settings-dnd = Do Not Disturb
 
 ## Settings — tooltips
 settings-tooltip-empty = Nothing to show

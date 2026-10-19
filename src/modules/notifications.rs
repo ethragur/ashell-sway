@@ -1,29 +1,30 @@
 use crate::{
     components::collapsible::{self, collapsible},
     components::icons::{StaticIcon, icon, icon_button},
+    components::scrollable,
     components::slide::{self, SlideDirection, slide},
-    components::{ButtonHierarchy, ButtonKind, ButtonSize, MenuSize},
-    config::{NotificationsModuleConfig, ToastPosition},
+    components::{ButtonHierarchy, ButtonKind, ButtonSize, MenuSize, styled_button},
+    config::{NotificationsModuleConfig, Surface, ToastPosition},
     services::{
-        ReadOnlyService, ServiceEvent,
+        ReadOnlyService, ServiceEvent, compositor, connection_pid,
         notifications::{
             Notification, NotificationIcon, NotificationsService, Urgency,
-            dbus::{NotificationDaemon, NotificationEvent},
+            dbus::{CloseGuard, DEFAULT_ACTION_KEY, NotificationDaemon, NotificationEvent},
         },
     },
     t,
-    theme::use_theme,
+    theme::{Paint, surface_border, use_theme},
 };
 use chrono::{DateTime, Local};
 use iced::{
     Alignment, Border, Column, Element, Length, Padding, Row, Size, Subscription, Task, Theme,
-    widget::{Space, button, column, container, image, row, scrollable, sensor, svg, text},
+    widget::{Container, Space, blur, button, column, container, image, row, sensor, svg, text},
 };
 use itertools::Itertools;
-use log::error;
+use log::{debug, error};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use zbus::Connection;
 
@@ -43,24 +44,44 @@ fn notification_icon<'a, M: 'a>(icon_kind: Option<&NotificationIcon>) -> Element
     }
 }
 
+/// The window to bring up once a click invokes a notification's default
+/// action: on Wayland the sender can't raise its own window without an
+/// `xdg-activation` token, so the compositor focuses it.
+#[derive(Debug)]
+struct FocusTarget {
+    sender: Option<String>,
+    apps: Vec<String>,
+}
+
 fn invoke_and_close_task(
     connection: Option<Connection>,
     id: u32,
     action_key: Option<String>,
+    guard: CloseGuard,
+    focus: Option<FocusTarget>,
 ) -> Task<Message> {
     Task::perform(
         async move {
-            if let Some(connection) = connection {
-                if let Some(action_key) = action_key
-                    && let Err(e) =
-                        NotificationDaemon::invoke_action(&connection, id, action_key).await
-                {
-                    error!("Failed to invoke notification action for id {}: {}", id, e);
+            let Some(connection) = connection else {
+                return;
+            };
+            match NotificationDaemon::invoke_and_close(&connection, id, action_key, guard).await {
+                Ok(true) => {
+                    if let Some(FocusTarget { sender, apps }) = focus {
+                        let pid = match sender {
+                            Some(sender) => connection_pid(&connection, &sender)
+                                .await
+                                .inspect_err(|e| debug!("No pid for sender {sender}: {e}"))
+                                .ok(),
+                            None => None,
+                        };
+                        if let Err(e) = compositor::focus_app_window(pid, apps, None).await {
+                            debug!("Can't focus the window of notification {id}: {e}");
+                        }
+                    }
                 }
-                if let Err(e) = NotificationDaemon::close_notification_by_id(&connection, id).await
-                {
-                    error!("Failed to close notification id {}: {}", id, e);
-                }
+                Ok(false) => {}
+                Err(e) => error!("Failed to close notification id {}: {}", id, e),
             }
         },
         |_| Message::NotificationClosed,
@@ -70,20 +91,22 @@ fn invoke_and_close_task(
 async fn close_notification_ids(connection: Option<Connection>, notification_ids: &[u32]) {
     if let Some(connection) = connection {
         for id in notification_ids {
-            if let Err(e) = NotificationDaemon::close_notification_by_id(&connection, *id).await {
+            if let Err(e) =
+                NotificationDaemon::invoke_and_close(&connection, *id, None, CloseGuard::Any).await
+            {
                 error!("Failed to close notification id {}: {}", id, e);
             }
         }
     }
 }
 
-fn close_notification_by_id_task(connection: Option<Connection>, id: u32) -> Task<Message> {
+fn evict_task(connection: Option<Connection>, evicted: Vec<(u32, u64)>) -> Task<Message> {
     Task::perform(
         async move {
             if let Some(connection) = connection
-                && let Err(e) = NotificationDaemon::close_notification_by_id(&connection, id).await
+                && let Err(e) = NotificationDaemon::evict_notifications(&connection, &evicted).await
             {
-                error!("Failed to close notification id {}: {}", id, e);
+                error!("Failed to close evicted notifications: {e}");
             }
         },
         |_| Message::NotificationClosed,
@@ -113,6 +136,7 @@ fn toast_timeout(required_timeout: i32, timeout_ms: u64) -> Option<Duration> {
 pub enum Message {
     ConfigReloaded(NotificationsModuleConfig),
     NotificationClicked(u32),
+    InvokeAction(u32, String),
     NotificationClosed,
     CloseNotificationById(u32),
     ClearNotifications,
@@ -121,6 +145,7 @@ pub enum Message {
     GroupCleared(String, Vec<u32>),
     Event(ServiceEvent<NotificationsService>),
     ToggleGroup(String),
+    ToggleDnd,
     ExpireToast(u32),
     DismissToast(u32),
     StartCollapse(u32),
@@ -140,9 +165,25 @@ pub enum NotificationStyle {
 pub enum Action {
     None,
     Task(Task<Message>),
+    /// Run the task and close the menu, e.g. to make way for the window of a
+    /// clicked notification.
+    TaskAndCloseMenu(Task<Message>),
     Show(Task<Message>),
     Hide(Task<Message>),
     UpdateToastInputRegion(Size),
+}
+
+impl Action {
+    fn with_task(self, task: Task<Message>) -> Self {
+        match self {
+            Action::None => Action::Task(task),
+            Action::Task(t) => Action::Task(Task::batch([t, task])),
+            Action::TaskAndCloseMenu(t) => Action::TaskAndCloseMenu(Task::batch([t, task])),
+            Action::Show(t) => Action::Show(Task::batch([t, task])),
+            Action::Hide(t) => Action::Hide(Task::batch([t, task])),
+            Action::UpdateToastInputRegion(_) => Action::Task(task),
+        }
+    }
 }
 
 // Must match the widget durations so task delays align with animation end.
@@ -163,7 +204,9 @@ pub struct Notifications {
     blocklist: Vec<crate::config::RegexCfg>,
     toasts: VecDeque<u32>,
     dismiss_phases: HashMap<u32, DismissPhase>,
+    toast_timers: HashMap<u32, Instant>,
     animations_enabled: bool,
+    dnd: bool,
 }
 
 impl Notifications {
@@ -177,12 +220,22 @@ impl Notifications {
             blocklist,
             toasts: VecDeque::new(),
             dismiss_phases: HashMap::new(),
+            toast_timers: HashMap::new(),
             animations_enabled,
+            dnd: false,
         }
     }
 
     pub fn set_animations_enabled(&mut self, enabled: bool) {
         self.animations_enabled = enabled;
+    }
+
+    pub fn dnd(&self) -> bool {
+        self.dnd
+    }
+
+    pub fn toggle_dnd(&mut self) {
+        self.dnd = !self.dnd;
     }
 
     fn is_blocklisted(&self, app_name: &str) -> bool {
@@ -195,23 +248,62 @@ impl Notifications {
         self.notifications.iter().find(|n| n.id == id)
     }
 
-    fn find_first_action_key(&self, id: u32) -> Option<String> {
+    fn close_guard(&self, id: u32) -> CloseGuard {
         self.find_notification(id)
-            .filter(|n| !n.actions.is_empty())
-            .and_then(|n| n.actions.first())
-            .cloned()
+            .map_or(CloseGuard::Any, |n| CloseGuard::Revision(n.revision))
+    }
+
+    /// `id`'s default action and the window it brings up; the action buttons
+    /// don't focus it.
+    fn default_action(&self, id: u32) -> Option<(String, FocusTarget)> {
+        let notification = self.find_notification(id)?;
+        notification
+            .action_pairs()
+            .any(|(key, _)| key == DEFAULT_ACTION_KEY)
+            .then(|| {
+                let target = FocusTarget {
+                    sender: notification.sender.clone(),
+                    apps: notification.app_ids(),
+                };
+                (DEFAULT_ACTION_KEY.to_string(), target)
+            })
+    }
+
+    fn invoke_and_dismiss(
+        &mut self,
+        id: u32,
+        action_key: Option<String>,
+        focus: Option<FocusTarget>,
+    ) -> Action {
+        let connection = self.connection.clone();
+        let guard = self.close_guard(id);
+        let invoke_task = invoke_and_close_task(connection, id, action_key, guard, focus);
+        if !self.toasts.contains(&id) || self.dismiss_phases.contains_key(&id) {
+            return Action::Task(invoke_task);
+        }
+        if !self.animations_enabled {
+            let had_toasts = self.remove_toast(id);
+            return self.hide_toasts_if_empty_with_task(had_toasts, invoke_task);
+        }
+        self.dismiss_phases.insert(id, DismissPhase::Sliding);
+        Action::Task(Task::batch(vec![
+            invoke_task,
+            delayed_toast_message(SLIDE_ANIMATION, id, Message::StartCollapse),
+        ]))
     }
 
     fn clear_toasts(&mut self) -> bool {
         let had_toasts = !self.toasts.is_empty();
         self.toasts.clear();
         self.dismiss_phases.clear();
+        self.toast_timers.clear();
         had_toasts
     }
 
     fn remove_toast(&mut self, id: u32) -> bool {
         let had_toasts = !self.toasts.is_empty();
         self.toasts.retain(|&toast_id| toast_id != id);
+        self.toast_timers.remove(&id);
         had_toasts
     }
 
@@ -219,6 +311,7 @@ impl Notifications {
         let had_toasts = !self.toasts.is_empty();
         let ids: HashSet<u32> = ids.iter().copied().collect();
         self.toasts.retain(|toast_id| !ids.contains(toast_id));
+        self.toast_timers.retain(|id, _| !ids.contains(id));
         had_toasts
     }
 
@@ -254,19 +347,24 @@ impl Notifications {
         match update_event {
             NotificationEvent::Received(notification) => {
                 if self.config.toast_limit == 0 {
-                    self.toasts.clear();
-                    self.dismiss_phases.clear();
-                    return Action::None;
+                    let had_toasts = self.clear_toasts();
+                    return self.hide_toasts_if_empty(had_toasts);
                 }
 
-                while self.toasts.len() >= self.config.toast_limit {
-                    if let Some(evicted) = self.toasts.pop_front() {
+                if !self.toasts.contains(&notification.id) {
+                    while self.toasts.len() >= self.config.toast_limit
+                        && let Some(evicted) = self.toasts.pop_front()
+                    {
                         self.dismiss_phases.remove(&evicted);
+                        self.toast_timers.remove(&evicted);
                     }
+                    self.toasts.push_back(notification.id);
                 }
-                self.toasts.push_back(notification.id);
 
-                let notification_id = notification.id;
+                // A replace cancels an in-flight dismissal so the replacement is
+                // shown instead of being swallowed by the slide-out.
+                self.dismiss_phases.remove(&notification.id);
+
                 // Critical notifications are persistent per the freedesktop
                 // spec: they must be acknowledged by the user.
                 let timeout = if notification.urgency == Urgency::Critical {
@@ -275,19 +373,24 @@ impl Notifications {
                     toast_timeout(notification.expire_timeout, self.config.toast_timeout)
                 };
 
-                let timer_task = if let Some(timeout) = timeout {
-                    Task::perform(
-                        async move {
-                            tokio::time::sleep(timeout).await;
-                            notification_id
-                        },
-                        Message::ExpireToast,
-                    )
+                let task = if let Some(timeout) = timeout {
+                    let deadline = Instant::now() + timeout;
+                    let previous = self.toast_timers.insert(notification.id, deadline);
+                    // Every wakeup either expires the toast, dropping the
+                    // deadline, or reschedules itself, so a stored deadline always
+                    // has a sleep in flight: one is only needed when there was no
+                    // deadline, or when the new one lands before the pending wakeup.
+                    if previous.is_none_or(|previous| deadline < previous) {
+                        delayed_toast_message(timeout, notification.id, Message::ExpireToast)
+                    } else {
+                        Task::none()
+                    }
                 } else {
+                    self.toast_timers.remove(&notification.id);
                     Task::none()
                 };
 
-                Action::Show(timer_task)
+                Action::Show(task)
             }
             NotificationEvent::Closed(id) => {
                 let id = *id;
@@ -300,16 +403,40 @@ impl Notifications {
         }
     }
 
-    fn apply_update_event(&mut self, update_event: NotificationEvent) {
+    fn apply_update_event(&mut self, update_event: NotificationEvent) -> Vec<(u32, u64)> {
         match update_event {
             NotificationEvent::Received(notification) => {
+                self.notifications.retain(|n| n.id != notification.id);
                 self.notifications.push_front(*notification);
+                self.evict_over_limit()
             }
             NotificationEvent::Closed(id) => {
-                if let Some(pos) = self.notifications.iter().position(|n| n.id == id) {
-                    self.notifications.remove(pos);
-                }
+                self.notifications.retain(|n| n.id != id);
+                Vec::new()
             }
+        }
+    }
+
+    /// Skips visible toasts, which can be older than the limit under DND.
+    fn evict_over_limit(&mut self) -> Vec<(u32, u64)> {
+        let mut evicted = Vec::new();
+        while self.notifications.len() > self.config.history_limit
+            && let Some(pos) = self
+                .notifications
+                .iter()
+                .rposition(|n| !self.toasts.contains(&n.id))
+            && let Some(notification) = self.notifications.remove(pos)
+        {
+            evicted.push((notification.id, notification.revision));
+        }
+        evicted
+    }
+
+    fn with_eviction(&self, action: Action, evicted: Vec<(u32, u64)>) -> Action {
+        if evicted.is_empty() {
+            action
+        } else {
+            action.with_task(evict_task(self.connection.clone(), evicted))
         }
     }
 
@@ -319,12 +446,14 @@ impl Notifications {
                 let hide = !config.toast && self.config.toast && !self.toasts.is_empty();
                 self.blocklist = config.blocklist.clone();
                 self.config = config;
-                if hide {
-                    self.toasts.clear();
+                let action = if hide {
+                    self.clear_toasts();
                     Action::Hide(Task::none())
                 } else {
                     Action::None
-                }
+                };
+                let evicted = self.evict_over_limit();
+                self.with_eviction(action, evicted)
             }
             Message::Event(event) => match event {
                 ServiceEvent::Init(service) => {
@@ -338,19 +467,42 @@ impl Notifications {
                         return Action::None;
                     }
 
-                    let toast_action = self.toast_action_for_update_event(&update_event);
-                    self.apply_update_event(update_event);
-
-                    toast_action
+                    let suppress_toast = self.dnd
+                        && matches!(
+                            &update_event,
+                            NotificationEvent::Received(notification)
+                                if notification.urgency != Urgency::Critical
+                        );
+                    let toast_action = if suppress_toast {
+                        Action::None
+                    } else {
+                        self.toast_action_for_update_event(&update_event)
+                    };
+                    let evicted = self.apply_update_event(update_event);
+                    self.with_eviction(toast_action, evicted)
                 }
                 ServiceEvent::Error(_) => Action::None,
             },
             Message::NotificationClicked(id) => {
                 let connection = self.connection.clone();
-                let action_key = self.find_first_action_key(id);
-                Action::Task(invoke_and_close_task(connection, id, action_key))
+                let (action_key, focus) = self.default_action(id).unzip();
+                let guard = self.close_guard(id);
+                let close_menu = focus.is_some();
+                let task = invoke_and_close_task(connection, id, action_key, guard, focus);
+                if close_menu {
+                    Action::TaskAndCloseMenu(task)
+                } else {
+                    Action::Task(task)
+                }
+            }
+            Message::InvokeAction(id, action_key) => {
+                self.invoke_and_dismiss(id, Some(action_key), None)
             }
             Message::NotificationClosed => Action::None,
+            Message::ToggleDnd => {
+                self.toggle_dnd();
+                Action::None
+            }
             Message::ClearNotifications => {
                 let connection = self.connection.clone();
                 let notification_ids: Vec<u32> = self.notifications.iter().map(|n| n.id).collect();
@@ -390,6 +542,20 @@ impl Notifications {
                 Action::None
             }
             Message::ExpireToast(id) => {
+                let Some(&deadline) = self.toast_timers.get(&id) else {
+                    return Action::None;
+                };
+                let now = Instant::now();
+                if now < deadline {
+                    // Replaced with a later deadline: wait out the remainder.
+                    return Action::Task(delayed_toast_message(
+                        deadline - now,
+                        id,
+                        Message::ExpireToast,
+                    ));
+                }
+                self.toast_timers.remove(&id);
+
                 if self.toasts.contains(&id) && !self.dismiss_phases.contains_key(&id) {
                     if !self.animations_enabled {
                         let had_toasts = self.remove_toast(id);
@@ -407,28 +573,17 @@ impl Notifications {
             }
             Message::CloseNotificationById(id) => {
                 let connection = self.connection.clone();
+                let guard = self.close_guard(id);
                 let had_toasts = self.remove_toast(id);
                 self.dismiss_phases.remove(&id);
 
-                let task = close_notification_by_id_task(connection, id);
+                let task = invoke_and_close_task(connection, id, None, guard, None);
                 self.hide_toasts_if_empty_with_task(had_toasts, task)
             }
             Message::DismissToast(id) => {
                 if self.toasts.contains(&id) && !self.dismiss_phases.contains_key(&id) {
-                    let connection = self.connection.clone();
-                    let action_key = self.find_first_action_key(id);
-                    let invoke_task = invoke_and_close_task(connection, id, action_key);
-                    if !self.animations_enabled {
-                        let had_toasts = self.remove_toast(id);
-                        let hide_action =
-                            self.hide_toasts_if_empty_with_task(had_toasts, invoke_task);
-                        return hide_action;
-                    }
-                    self.dismiss_phases.insert(id, DismissPhase::Sliding);
-                    Action::Task(Task::batch(vec![
-                        invoke_task,
-                        delayed_toast_message(SLIDE_ANIMATION, id, Message::StartCollapse),
-                    ]))
+                    let (action_key, focus) = self.default_action(id).unzip();
+                    self.invoke_and_dismiss(id, action_key, focus)
                 } else {
                     Action::None
                 }
@@ -446,7 +601,10 @@ impl Notifications {
                 }
             }
             Message::DismissAnimationComplete(id) => {
-                self.dismiss_phases.remove(&id);
+                if self.dismiss_phases.remove(&id).is_none() {
+                    // Cancelled by a replace: the toast is on screen again.
+                    return Action::None;
+                }
                 let had_toasts = self.remove_toast(id);
                 self.hide_toasts_if_empty(had_toasts)
             }
@@ -463,13 +621,10 @@ impl Notifications {
         style: NotificationStyle,
         urgency: Urgency,
     ) -> impl Fn(&Theme, iced::widget::button::Status) -> iced::widget::button::Style + use<> {
-        let (radius, menu_opacity) = use_theme(|t| (t.radius, t.menu.opacity));
+        let radius = use_theme(|t| t.radius);
         move |iced_theme: &Theme, status| {
             let mut border = match style {
-                NotificationStyle::Toast => Border::default()
-                    .width(1)
-                    .color(iced_theme.extended_palette().background.weakest.color)
-                    .rounded(radius.lg),
+                NotificationStyle::Toast => surface_border(iced_theme, radius.lg),
                 NotificationStyle::Standalone => Border::default().rounded(radius.lg),
                 NotificationStyle::GroupHeader => Border::default().rounded(iced::border::Radius {
                     top_left: radius.lg,
@@ -496,38 +651,22 @@ impl Notifications {
                 border,
                 ..iced::widget::button::Style::default()
             };
-            match status {
-                iced::widget::button::Status::Hovered => {
-                    if style == NotificationStyle::Toast {
-                        button_style.background = Some(
-                            iced_theme
-                                .extended_palette()
-                                .background
-                                .weak
-                                .color
-                                .scale_alpha(menu_opacity)
-                                .into(),
-                        );
-                    } else {
-                        button_style.background = Some(
-                            iced_theme
-                                .extended_palette()
-                                .background
-                                .strong
-                                .color
-                                .scale_alpha(menu_opacity)
-                                .into(),
-                        );
-                    }
+            let bg = Paint::surface(
+                iced_theme,
+                if style == NotificationStyle::Toast {
+                    iced_theme.extended_palette().background.base.color
+                } else {
+                    iced_theme.extended_palette().background.weak.color
+                },
+            );
+            button_style.background = Some(
+                if matches!(status, iced::widget::button::Status::Hovered) {
+                    bg.hovered(iced_theme)
+                } else {
+                    bg
                 }
-                _ => {
-                    button_style.background = if style == NotificationStyle::Toast {
-                        Some(iced_theme.palette().background.into())
-                    } else {
-                        Some(iced_theme.extended_palette().background.weak.color.into())
-                    }
-                }
-            }
+                .into(),
+            );
             button_style
         }
     }
@@ -599,7 +738,11 @@ impl Notifications {
             card = card.max_height(self.config.toast_max_height).clip(true);
         }
 
-        button(card)
+        // Outside the clipped card so a tall body never hides the buttons.
+        let actions_row = Self::action_buttons(notification)
+            .map(|row| row.padding(Padding::new(space.xs).top(0.)));
+
+        button(column!(card, actions_row))
             .on_press(on_press)
             .width(Length::Fill)
             .padding(space.xxs)
@@ -612,6 +755,27 @@ impl Notifications {
                 notification.urgency,
             ))
             .into()
+    }
+
+    /// One button per non-default action; `None` when there are none.
+    /// Sized to their labels and right-aligned, so a single short action
+    /// doesn't stretch across the whole notification.
+    fn action_buttons<'a>(notification: &'a Notification) -> Option<Container<'a, Message>> {
+        let space = use_theme(|t| t.space);
+        let buttons = notification
+            .action_pairs()
+            .filter(|(key, _)| *key != DEFAULT_ACTION_KEY)
+            .map(|(key, label)| {
+                styled_button(label)
+                    .kind(ButtonKind::Outline)
+                    .size(ButtonSize::Small)
+                    .on_press(Message::InvokeAction(notification.id, key.to_string()))
+                    .into()
+            })
+            .collect::<Vec<Element<'a, Message>>>();
+        (!buttons.is_empty()).then(|| {
+            container(Row::with_children(buttons).spacing(space.xs)).align_right(Length::Fill)
+        })
     }
 
     fn group_item<'a>(
@@ -628,7 +792,8 @@ impl Notifications {
                         .width(Length::Fill),
                     text(self.format_timestamp(notification.timestamp)).size(font_size.sm)
                 ),
-                text(&notification.body).wrapping(text::Wrapping::WordOrGlyph)
+                text(&notification.body).wrapping(text::Wrapping::WordOrGlyph),
+                Self::action_buttons(notification)
             )
             .padding(space.xs)
             .spacing(space.xs),
@@ -646,11 +811,14 @@ impl Notifications {
     }
 
     pub fn view(&'_ self) -> Element<'_, Message> {
-        if !self.notifications.is_empty() {
-            icon(StaticIcon::BellBadge).into()
+        let bell_icon = if self.dnd {
+            StaticIcon::BellOff
+        } else if !self.notifications.is_empty() {
+            StaticIcon::BellBadge
         } else {
-            icon(StaticIcon::Bell).into()
-        }
+            StaticIcon::Bell
+        };
+        icon(bell_icon).into()
     }
 
     pub fn menu_view<'a>(&'a self) -> Element<'a, Message> {
@@ -676,6 +844,20 @@ impl Notifications {
                         .width(Length::Fill)
                         .size(font_size.lg)
                 )
+                .push(
+                    icon_button(if self.dnd {
+                        StaticIcon::BellOff
+                    } else {
+                        StaticIcon::Bell
+                    })
+                    .kind(ButtonKind::Transparent)
+                    .hierarchy(if self.dnd {
+                        ButtonHierarchy::Danger
+                    } else {
+                        ButtonHierarchy::Secondary
+                    })
+                    .on_press(Message::ToggleDnd)
+                )
                 .push((!is_empty).then(|| {
                     icon_button(StaticIcon::Delete).on_press(Message::ClearNotifications)
                 })),
@@ -695,8 +877,13 @@ impl Notifications {
         let slide_direction = match self.config.toast_position {
             ToastPosition::TopRight | ToastPosition::BottomRight => SlideDirection::Right,
             ToastPosition::TopLeft | ToastPosition::BottomLeft => SlideDirection::Left,
+            ToastPosition::TopCenter => SlideDirection::Up,
+            ToastPosition::BottomCenter => SlideDirection::Down,
         };
         let card_width = MenuSize::Medium.size();
+        // A toast is alone on its surface, so it publishes its own blur region.
+        let (blur_enabled, card_radius) =
+            use_theme(|t| (t.surface(Surface::Notifications).blur, t.radius.lg));
 
         let mut toast_column = column!().spacing(space.sm);
 
@@ -708,16 +895,18 @@ impl Notifications {
                 toast_column = toast_column.push(
                     collapsible(
                         !is_collapsing,
-                        slide(
-                            !is_dismissing,
-                            slide_direction,
-                            card_width,
-                            self.notification_card(
+                        slide(!is_dismissing, slide_direction, card_width, {
+                            let card = self.notification_card(
                                 notification,
                                 Message::DismissToast(notification.id),
                                 true,
-                            ),
-                        )
+                            );
+                            if blur_enabled {
+                                blur(card_radius, card).into()
+                            } else {
+                                card
+                            }
+                        })
                         .animated(self.animations_enabled)
                         .key(toast_id as u64),
                     )
@@ -728,12 +917,17 @@ impl Notifications {
         }
 
         let v_align = match self.config.toast_position {
-            ToastPosition::TopLeft | ToastPosition::TopRight => Alignment::Start,
-            ToastPosition::BottomLeft | ToastPosition::BottomRight => Alignment::End,
+            ToastPosition::TopLeft | ToastPosition::TopRight | ToastPosition::TopCenter => {
+                Alignment::Start
+            }
+            ToastPosition::BottomLeft
+            | ToastPosition::BottomRight
+            | ToastPosition::BottomCenter => Alignment::End,
         };
         let h_align = match self.config.toast_position {
             ToastPosition::TopLeft | ToastPosition::BottomLeft => Alignment::Start,
             ToastPosition::TopRight | ToastPosition::BottomRight => Alignment::End,
+            ToastPosition::TopCenter | ToastPosition::BottomCenter => Alignment::Center,
         };
 
         let toast_content = sensor(

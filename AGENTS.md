@@ -3,7 +3,7 @@
 ## Quick reference
 
 ```bash
-make check    # format check + cargo check + clippy -D warnings (run before pushing)
+make check    # cargo fmt (rewrites files) + cargo check + clippy -D warnings on the whole workspace (run before pushing)
 make build    # cargo build --release
 make fmt      # cargo fmt
 make start    # run ./target/release/ashell
@@ -12,7 +12,8 @@ make install  # install binary to /usr/bin (requires sudo)
 
 ## Project overview
 
-ashell is a Wayland status bar for Hyprland and Niri, written in Rust with the iced GUI framework.
+ashell is a status bar for Wayland compositors, written in Rust with the iced GUI framework.
+It has dedicated backends for Hyprland and Niri and a generic Wayland fallback for other compositors.
 It follows the Elm architecture (model → update → view) with a modular design separating UI modules from backend services.
 
 - **Edition:** 2024, **MSRV:** 1.89
@@ -33,22 +34,25 @@ src/
 ├── app.rs               # App state, Elm update/view cycle
 ├── config.rs            # configuration types (TOML deserialization)
 ├── ipc.rs               # Unix socket IPC (client + server + subscription)
-├── theme.rs             # theming (Islands/Solid/Gradient styles)
+├── theme.rs             # theming (transparent/solid bar surface, radius, margin)
 ├── menu.rs              # menu UI
 ├── outputs.rs           # multi-monitor output management
 ├── components/          # shared UI components, icons
 ├── modules/             # UI modules (clock, workspaces, settings, tray, etc.)
 │   └── settings/        # settings sub-panels (audio, network, bluetooth, power, brightness)
-├── services/            # backend services (D-Bus, IPC, system integration)
-│   ├── compositor/      # Hyprland/Niri IPC abstraction
+├── services/            # iced glue (ReadOnlyService/Service) + services not yet migrated to ashell-services
+│   ├── compositor/      # Hyprland/Niri/generic Wayland abstraction
 │   ├── network/         # NetworkManager + IWD backends
-│   ├── bluetooth/
 │   ├── mpris/           # media player control
 │   ├── tray/
 │   └── upower/          # battery/power
 ├── widgets/             # custom iced widgets (centerbox, position_button, menu_wrapper)
 └── utils/
+crates/
+└── ashell-services/     # UI-agnostic services (no iced dependency), e.g. bluetooth
 ```
+
+The repo is a Cargo workspace: the root package is the `ashell` binary, `crates/ashell-services` is a library member.
 
 ## Key system dependencies
 
@@ -93,7 +97,8 @@ Scope examples: `fix(brightness)`, `feat(system_info)`, `fix(network)`
 ## Architecture patterns
 
 - **Elm architecture:** `App` struct holds all state. `Message` enum drives updates. `update()` returns `Task<Message>` for async work.
-- **Services** are backend abstractions (D-Bus, IPC). Two traits: `ReadOnlyService` and `Service` (mutable).
+- **Services** are backend abstractions (D-Bus, IPC). Two traits: `ReadOnlyService` and `Service` (mutable). Services moved to `ashell-services` expose a plain API with no trait (a cloneable handle with `execute(command)` and an updates `Stream` that starts with the current state); a module in `src/services/` wraps each one into the iced traits.
 - **Modules** are UI components (workspaces, clock, settings). Each implements `view()` returning iced `Element`.
-- **Compositor abstraction:** `CompositorService` trait with Hyprland and Niri implementations, auto-detected at runtime.
+- **Compositor abstraction:** the `CompositorChoice` enum routes to per-backend modules (Hyprland, Niri, generic Wayland), each exposing `is_available`/`run_listener`/`execute_command`, auto-detected at runtime.
 - **Config hot-reload:** inotify file watcher triggers `ConfigChanged` message on config file changes.
+- **Translations:** Fluent catalogs in `i18n/<lang-tag>/ashell.ftl`, registered in `CATALOGS` in `src/i18n.rs`. When adding or changing a translation, follow "Adding a Translation" in `docs/src/contributing/common-tasks.md`: check desktop terms against the GNOME and KDE translations for that language and weather terms against libgweather and a major weather site, rather than translating strings in isolation.

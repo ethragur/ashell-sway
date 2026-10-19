@@ -1,19 +1,19 @@
 use crate::{
     HEIGHT,
-    components::{ButtonUIRef, Centerbox, menu::MenuType},
-    config::{self, AppearanceStyle, Config, Modules, Position},
+    components::{Centerbox, menu::MenuType},
+    config::{self, BarSurface, Config, ModuleName, Modules, Surface, WorkspaceIndicatorFormat},
     get_log_spec,
     i18n::{Localizer, init_localizer},
     ipc::IpcCommand,
     modules::{
         self,
-        custom_module::{self, Custom},
+        custom_module::Custom,
         keyboard_layout::KeyboardLayout,
         keyboard_submap::KeyboardSubmap,
         media_player::MediaPlayer,
         notifications::Notifications,
         privacy::Privacy,
-        settings::{self, Settings, audio},
+        settings::{self, Settings},
         system_info::SystemInfo,
         tempo::Tempo,
         tray::TrayModule,
@@ -21,23 +21,21 @@ use crate::{
         window_title::WindowTitle,
         workspaces::Workspaces,
     },
-    osd::{self, Osd, OsdKind},
+    osd::{self, Osd},
     outputs::{HasOutput, Outputs},
-    services::ReadOnlyService,
-    theme::{AshellTheme, backdrop_color, darken_color, init_theme, use_theme},
+    services::{ReadOnlyService, xdg_icons},
+    theme::{AshellTheme, BarLayout, backdrop_color, darken_color, init_theme, use_theme},
 };
 use flexi_logger::LoggerHandle;
 use iced::futures::StreamExt;
 use iced::{
-    Alignment, Color, Element, Gradient, Length, OutputEvent, Radians, Subscription, SurfaceId,
-    Task, Theme,
+    Alignment, Element, Length, OutputEvent, Subscription, SurfaceId, Task, Theme,
     event::listen_with,
-    gradient::Linear,
-    keyboard, set_exclusive_zone,
-    widget::{Row, container, mouse_area},
+    keyboard,
+    widget::{Row, blur_container, container, mouse_area},
 };
 use log::{debug, info, warn};
-use std::{collections::HashMap, f32::consts::PI, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf};
 
 const OSD_WIDTH: u32 = 250;
 const OSD_HEIGHT: u32 = 64;
@@ -72,37 +70,12 @@ pub struct App {
     pub media_player: MediaPlayer,
     pub notifications: Notifications,
     pub osd: Osd,
-    pub visible: bool,
 }
 
-#[derive(Debug, Clone)]
-pub enum Message {
-    ConfigChanged(Box<Config>),
-    ToggleMenu(MenuType, SurfaceId, ButtonUIRef),
-    CloseMenu(SurfaceId),
-    /// Fired after a menu's close animation ends, to destroy its surface.
-    FinishCloseMenu(SurfaceId),
-    Custom(String, custom_module::Message),
-    Updates(modules::updates::Message),
-    Workspaces(modules::workspaces::Message),
-    WindowTitle(modules::window_title::Message),
-    SystemInfo(modules::system_info::Message),
-    KeyboardLayout(modules::keyboard_layout::Message),
-    KeyboardSubmap(modules::keyboard_submap::Message),
-    Tray(modules::tray::Message),
-    Tempo(modules::tempo::Message),
-    Privacy(modules::privacy::Message),
-    Settings(modules::settings::Message),
-    MediaPlayer(modules::media_player::Message),
-    Notifications(modules::notifications::Message),
-    Osd(osd::Message),
-    IpcOsdCommand(IpcCommand),
-    OutputEvent(OutputEvent),
-    CloseAllMenus,
-    ResumeFromSleep,
-    None,
-    ToggleVisibility,
-}
+mod message;
+mod osd_info;
+
+pub use message::Message;
 
 impl App {
     pub fn new(
@@ -110,7 +83,7 @@ impl App {
     ) -> impl FnOnce() -> (Self, Task<Message>) {
         move || {
             let mut outputs = Outputs::new(
-                config.appearance.style,
+                BarLayout::from_appearance(&config.appearance.bar),
                 config.position,
                 config.layer,
                 config.appearance.scale_factor,
@@ -132,6 +105,14 @@ impl App {
             init_localizer(resolve_localizer(&config));
 
             let notifications = Notifications::new(config.notifications, config.animations.enabled);
+
+            let needs_icons = config.modules.contains(&ModuleName::Tray)
+                || config.workspaces.indicator_format == WorkspaceIndicatorFormat::NameAndIcons;
+            let warm_icons = if needs_icons {
+                Task::perform(xdg_icons::warm_cache_async(), |()| ()).discard()
+            } else {
+                Task::none()
+            };
 
             (
                 App {
@@ -158,14 +139,13 @@ impl App {
                     notifications,
                     media_player: MediaPlayer::new(config.media_player),
                     osd: Osd::new(config.osd),
-                    visible: true,
                 },
-                Task::none(),
+                warm_icons,
             )
         }
     }
 
-    fn refresh_config(&mut self, config: Box<Config>) {
+    fn refresh_config(&mut self, config: Box<Config>) -> Task<Message> {
         init_theme(AshellTheme::new(
             config.position,
             &config.appearance,
@@ -178,17 +158,37 @@ impl App {
             layer: config.layer,
             enable_esc_key: config.enable_esc_key,
         };
-        let custom = config
+        // A reload can drop a module or reset its listen data, removing the
+        // hover target of an open tooltip: no unhover would ever close it.
+        let close_custom_tooltips = Task::batch(
+            self.custom
+                .keys()
+                .map(|name| {
+                    self.outputs.close_all_menu_if(
+                        MenuType::CustomTooltip(name.clone()),
+                        self.general_config.enable_esc_key,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut previous = std::mem::take(&mut self.custom);
+        self.custom = config
             .custom_modules
             .into_iter()
-            .map(|o| (o.name.clone(), Custom::new(o)))
+            .map(|o| {
+                let prev = previous.remove(&o.name);
+                (o.name.clone(), Custom::reconfigure(prev, o))
+            })
             .collect();
+        let existing_updates = self.updates.take();
+        self.updates = config.updates.map(|updates_config| {
+            let mut updates =
+                existing_updates.unwrap_or_else(|| Updates::new(updates_config.clone()));
+            updates.update(modules::updates::Message::ConfigReloaded(updates_config));
+            updates
+        });
 
-        self.custom = custom;
-        self.updates = config.updates.map(Updates::new);
-
-        // ignore task, since config change should not generate any
-        let _ = self
+        let workspaces_task = self
             .workspaces
             .update(modules::workspaces::Message::ConfigReloaded(
                 config.workspaces,
@@ -200,7 +200,10 @@ impl App {
                 config.window_title,
             ));
 
-        self.system_info = SystemInfo::new(config.system_info);
+        self.system_info
+            .update(modules::system_info::Message::ConfigReloaded(
+                config.system_info,
+            ));
 
         let _ = self
             .keyboard_layout
@@ -209,11 +212,12 @@ impl App {
             ))
             .map(Message::KeyboardLayout);
 
-        self.keyboard_submap = KeyboardSubmap::default();
         self.tempo
             .update(modules::tempo::Message::ConfigReloaded(config.tempo));
         self.settings
-            .update(modules::settings::Message::ConfigReloaded(config.settings));
+            .update(modules::settings::Message::ConfigReloaded(Box::new(
+                config.settings,
+            )));
         self.media_player
             .update(modules::media_player::Message::ConfigReloaded(
                 config.media_player,
@@ -222,107 +226,27 @@ impl App {
             .set_animations_enabled(config.animations.enabled);
         self.notifications
             .set_animations_enabled(config.animations.enabled);
-        let _ = self
-            .notifications
-            .update(modules::notifications::Message::ConfigReloaded(
-                config.notifications,
-            ));
+        let notifications_task = self.update(Message::Notifications(
+            modules::notifications::Message::ConfigReloaded(config.notifications),
+        ));
+        self.tray
+            .update(modules::tray::Message::ConfigReloaded(config.tray));
         self.osd.update(osd::Message::ConfigReloaded(config.osd));
+
+        Task::batch([close_custom_tooltips, workspaces_task, notifications_task])
     }
 
-    pub fn theme(&self) -> Theme {
-        use_theme(|t| t.iced_theme.clone())
+    pub fn theme(&self, id: SurfaceId) -> Theme {
+        let surface = self
+            .outputs
+            .has(id)
+            .map_or(Surface::Bar, |output| output.surface());
+
+        use_theme(|t| t.surface(surface).iced_theme.clone())
     }
 
-    pub fn scale_factor(&self) -> f64 {
-        use_theme(|t| t.scale_factor)
-    }
-
-    /// Build OSD display info (kind, normalised value, bar scale, muted) for the
-    /// given IPC command, reading current state from the Settings services.
-    fn osd_info_for(&self, cmd: &IpcCommand) -> Option<(OsdKind, f32, f32, bool)> {
-        fn normalise(cur: u32, max: u32) -> f32 {
-            if max > 0 {
-                cur as f32 / max as f32
-            } else {
-                0.0
-            }
-        }
-
-        match cmd {
-            IpcCommand::VolumeUp { .. } | IpcCommand::VolumeDown { .. } => {
-                // Use slider value — it has the optimistic RequestAndTimeout update,
-                // which was computed from real_sink_volume in volume_adjust().
-                let vol = self.settings.audio().current_sink_volume().unwrap_or(0);
-                let muted = self.settings.audio().is_sink_muted().unwrap_or(false);
-                let scale =
-                    normalise(self.settings.audio().vol_max(), audio::NORMAL_VOLUME).max(1.0);
-                Some((
-                    OsdKind::Volume,
-                    normalise(vol, audio::NORMAL_VOLUME),
-                    scale,
-                    muted,
-                ))
-            }
-            IpcCommand::VolumeToggleMute { .. } => {
-                let vol = self.settings.audio().real_sink_volume().unwrap_or(0);
-                // Invert: the toggle was just sent but PulseAudio hasn't
-                // round-tripped yet, so the current state is stale.
-                let muted = !self.settings.audio().is_sink_muted().unwrap_or(false);
-                let scale =
-                    normalise(self.settings.audio().vol_max(), audio::NORMAL_VOLUME).max(1.0);
-                Some((
-                    OsdKind::Volume,
-                    normalise(vol, audio::NORMAL_VOLUME),
-                    scale,
-                    muted,
-                ))
-            }
-            IpcCommand::MicrophoneUp { .. } | IpcCommand::MicrophoneDown { .. } => {
-                // Use slider value — it has the optimistic RequestAndTimeout update,
-                // which was computed from real_source_volume in microphone_adjust().
-                let vol = self.settings.audio().current_source_volume().unwrap_or(0);
-                let muted = self.settings.audio().is_source_muted().unwrap_or(false);
-                Some((
-                    OsdKind::Microphone,
-                    normalise(vol, audio::AudioSettings::mic_max()),
-                    1.0,
-                    muted,
-                ))
-            }
-            IpcCommand::MicrophoneToggleMute { .. } => {
-                let vol = self.settings.audio().real_source_volume().unwrap_or(0);
-                // Invert: the toggle was just sent but PulseAudio hasn't
-                // round-tripped yet, so the current state is stale.
-                let muted = !self.settings.audio().is_source_muted().unwrap_or(false);
-                Some((
-                    OsdKind::Microphone,
-                    normalise(vol, audio::AudioSettings::mic_max()),
-                    1.0,
-                    muted,
-                ))
-            }
-            IpcCommand::BrightnessUp { .. } | IpcCommand::BrightnessDown { .. } => self
-                .settings
-                .brightness()
-                .current_brightness()
-                .map(|(cur, max)| (OsdKind::Brightness, normalise(cur, max), 1.0, false)),
-            IpcCommand::ToggleAirplaneMode { .. } => {
-                // After toggle: the new state is the opposite of current.
-                // For toggles, `muted` carries the active/enabled state; `value` is unused.
-                let active = !self.settings.network().is_airplane_mode().unwrap_or(false);
-                Some((OsdKind::Airplane, 0.0, 1.0, active))
-            }
-            IpcCommand::ToggleIdleInhibitor { .. } => {
-                if let Some(idle_inhibitor) = self.settings.idle_inhibitor() {
-                    let active = idle_inhibitor.is_inhibited();
-                    Some((OsdKind::IdleInhibitor, 0.0, 1.0, active))
-                } else {
-                    None
-                }
-            }
-            IpcCommand::ToggleVisibility => None,
-        }
+    pub fn scale_factor(&self, _id: SurfaceId) -> f32 {
+        use_theme(|t| t.scale_factor) as f32
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -334,17 +258,18 @@ impl App {
                     "Current outputs: {:?}, new outputs: {:?}",
                     self.general_config.outputs, config.outputs
                 );
-                let (bar_position, bar_style, scale_factor) =
-                    use_theme(|t| (t.bar_position, t.bar_style, t.scale_factor));
+                let (bar_position, bar_layout, scale_factor) =
+                    use_theme(|t| (t.bar_position, t.bar_layout(), t.scale_factor));
+                let new_layout = BarLayout::from_appearance(&config.appearance.bar);
                 if self.general_config.outputs != config.outputs
                     || bar_position != config.position
-                    || bar_style != config.appearance.style
+                    || bar_layout != new_layout
                     || scale_factor != config.appearance.scale_factor
                     || self.general_config.layer != config.layer
                 {
                     warn!("Outputs changed, syncing");
                     tasks.push(self.outputs.sync(
-                        config.appearance.style,
+                        new_layout,
                         &config.outputs,
                         config.position,
                         config.layer,
@@ -352,8 +277,9 @@ impl App {
                     ));
                 }
 
-                self.logger.set_new_spec(get_log_spec(&config.log_level));
-                self.refresh_config(config);
+                self.logger
+                    .set_new_spec(get_log_spec(&config.logging.level));
+                tasks.push(self.refresh_config(config));
 
                 Task::batch(tasks)
             }
@@ -379,6 +305,12 @@ impl App {
                             },
                         );
                     }
+                    MenuType::MediaPlayer
+                        if !self.outputs.menu_of_type_is_open(&MenuType::MediaPlayer) =>
+                    {
+                        self.media_player
+                            .update(modules::media_player::Message::MenuOpened);
+                    }
                     _ => {}
                 };
                 cmd.push(self.outputs.toggle_menu(
@@ -396,11 +328,28 @@ impl App {
             }
             Message::FinishCloseMenu(id) => self.outputs.finish_close_menu(id),
             Message::Custom(name, msg) => {
-                if let Some(custom) = self.custom.get_mut(&name) {
-                    custom.update(msg);
+                let Some(custom) = self.custom.get_mut(&name) else {
+                    return Task::none();
+                };
+                match custom.update(msg) {
+                    modules::custom_module::Action::None => Task::none(),
+                    modules::custom_module::Action::OpenTooltipMenu(id, ui_ref) => self
+                        .outputs
+                        .toggle_menu(id, MenuType::CustomTooltip(name), ui_ref, false),
+                    modules::custom_module::Action::CloseTooltipMenu(id) => {
+                        self.outputs.close_menu(
+                            id,
+                            Some(MenuType::CustomTooltip(name)),
+                            self.general_config.enable_esc_key,
+                        )
+                    }
+                    modules::custom_module::Action::CloseAllTooltipMenus => {
+                        self.outputs.close_all_menu_if(
+                            MenuType::CustomTooltip(name),
+                            self.general_config.enable_esc_key,
+                        )
+                    }
                 }
-
-                Task::none()
             }
             Message::Updates(msg) => {
                 if let Some(updates) = self.updates.as_mut() {
@@ -473,7 +422,12 @@ impl App {
                     self.outputs
                         .close_menu(id, None, self.general_config.enable_esc_key)
                 }
-                modules::settings::Action::RequestKeyboard(id) => self.outputs.request_keyboard(id),
+                modules::settings::Action::RequestKeyboardWithCommand(id, task) => {
+                    Task::batch(vec![
+                        task.map(Message::Settings),
+                        self.outputs.request_keyboard(id),
+                    ])
+                }
                 modules::settings::Action::ReleaseKeyboard(id) => self.outputs.release_keyboard(id),
                 modules::settings::Action::ReleaseKeyboardWithCommand(id, task) => {
                     Task::batch(vec![
@@ -487,20 +441,32 @@ impl App {
                 modules::settings::Action::CloseTooltipMenu(id, menu_type) => self
                     .outputs
                     .close_menu(id, Some(menu_type), self.general_config.enable_esc_key),
+                modules::settings::Action::ToggleDnd => {
+                    self.notifications.toggle_dnd();
+                    Task::none()
+                }
             },
             Message::OutputEvent(event) => match event {
                 OutputEvent::Added(info) => {
                     info!("Output created: {info:?}");
-                    let name = &format!("{} {} {}", info.name, info.make, info.model);
+                    // Keep canonical workspace identity separate from description-based
+                    // target matching, which may include monitor serial numbers.
+                    let name = info.name.as_str();
+                    // Preserve existing targets even when the compositor uses different separators.
+                    let description = match info.description {
+                        Some(d) => format!("{} {} {} {d}", info.name, info.make, info.model),
+                        None => format!("{} {} {}", info.name, info.make, info.model),
+                    };
 
-                    let (bar_style, bar_position, scale_factor) =
-                        use_theme(|t| (t.bar_style, t.bar_position, t.scale_factor));
+                    let (bar_layout, bar_position, scale_factor) =
+                        use_theme(|t| (t.bar_layout(), t.bar_position, t.scale_factor));
                     let task = self.outputs.add(
-                        bar_style,
+                        bar_layout,
                         &self.general_config.outputs,
                         bar_position,
                         self.general_config.layer,
                         name,
+                        &description,
                         info.id,
                         scale_factor,
                     );
@@ -514,10 +480,10 @@ impl App {
                 }
                 OutputEvent::Removed(output_id) => {
                     info!("Output destroyed");
-                    let (bar_style, bar_position, scale_factor) =
-                        use_theme(|t| (t.bar_style, t.bar_position, t.scale_factor));
+                    let (bar_layout, bar_position, scale_factor) =
+                        use_theme(|t| (t.bar_layout(), t.bar_position, t.scale_factor));
                     self.outputs.remove(
-                        bar_style,
+                        bar_layout,
                         bar_position,
                         self.general_config.layer,
                         output_id,
@@ -536,6 +502,11 @@ impl App {
             Message::MediaPlayer(msg) => match self.media_player.update(msg) {
                 modules::media_player::Action::None => Task::none(),
                 modules::media_player::Action::Command(task) => task.map(Message::MediaPlayer),
+                modules::media_player::Action::CommandAndCloseMenu(task) => Task::batch(vec![
+                    self.outputs
+                        .close_all_menus(self.general_config.enable_esc_key),
+                    task.map(Message::MediaPlayer),
+                ]),
             },
             Message::CloseAllMenus => {
                 if self.outputs.menu_is_open() {
@@ -546,10 +517,10 @@ impl App {
                 }
             }
             Message::ResumeFromSleep => {
-                let (bar_style, bar_position, scale_factor) =
-                    use_theme(|t| (t.bar_style, t.bar_position, t.scale_factor));
+                let (bar_layout, bar_position, scale_factor) =
+                    use_theme(|t| (t.bar_layout(), t.bar_position, t.scale_factor));
                 self.outputs.sync(
-                    bar_style,
+                    bar_layout,
                     &self.general_config.outputs,
                     bar_position,
                     self.general_config.layer,
@@ -559,6 +530,11 @@ impl App {
             Message::Notifications(message) => match self.notifications.update(message) {
                 modules::notifications::Action::None => Task::none(),
                 modules::notifications::Action::Task(task) => task.map(Message::Notifications),
+                modules::notifications::Action::TaskAndCloseMenu(task) => Task::batch(vec![
+                    self.outputs
+                        .close_all_menus(self.general_config.enable_esc_key),
+                    task.map(Message::Notifications),
+                ]),
                 modules::notifications::Action::Show(task) => {
                     let position = self.notifications.toast_position();
                     // Double width gives the card a runway to fully exit on slide-out.
@@ -602,6 +578,12 @@ impl App {
                         );
                         modules::settings::Action::None
                     }
+                    IpcCommand::LoadConfig { .. } => {
+                        warn!(
+                            "IpcCommand::LoadConfig reached IpcOsdCommand handler; use Message::LoadConfig instead"
+                        );
+                        modules::settings::Action::None
+                    }
                 };
                 if let settings::Action::Command(task) = action {
                     tasks.push(task.map(Message::Settings));
@@ -609,7 +591,7 @@ impl App {
 
                 // Show OSD overlay if enabled.
                 if self.osd.config().enabled && !cmd.no_osd() {
-                    let osd_info = self.osd_info_for(&cmd);
+                    let osd_info = osd_info::osd_info_for(self, &cmd);
 
                     if let Some((kind, value, scale, muted)) = osd_info
                         && let osd::Action::Show(timer) = self.osd.update(osd::Message::Show {
@@ -632,51 +614,53 @@ impl App {
             },
             Message::None => Task::none(),
             Message::ToggleVisibility => {
-                self.visible = !self.visible;
-                let (bar_style, scale_factor) = use_theme(|t| (t.bar_style, t.scale_factor));
-                let height = if self.visible {
-                    (crate::HEIGHT
-                        - match bar_style {
-                            AppearanceStyle::Solid | AppearanceStyle::Gradient => 8.,
-                            AppearanceStyle::Islands => 0.,
-                        })
-                        * scale_factor
-                } else {
-                    0.0
-                };
+                let task = self.outputs.toggle_visibility();
 
-                Task::batch(
-                    self.outputs
-                        .iter()
-                        .filter_map(|(_, shell_info, _)| {
-                            shell_info
-                                .as_ref()
-                                .map(|info| set_exclusive_zone(info.id, height as i32))
-                        })
-                        .collect::<Vec<_>>(),
-                )
+                if self.outputs.bar_is_shown() {
+                    task
+                } else {
+                    // A menu surface spans the whole output and keeps accepting
+                    // input there, so hiding the bar has to close it instead of
+                    // leaving it floating over the desktop.
+                    Task::batch(vec![
+                        task,
+                        self.outputs
+                            .close_all_menus(self.general_config.enable_esc_key),
+                    ])
+                }
             }
+            Message::LoadConfig(config_file) => match config::read_config(&config_file) {
+                Ok(config) => {
+                    self.config_path = config_file;
+                    self.update(Message::ConfigChanged(Box::new(config)))
+                }
+                Err(e) => {
+                    warn!("Invalid config {}: {e}", config_file.display());
+                    Task::none()
+                }
+            },
         }
     }
 
     pub fn view(&'_ self, id: SurfaceId) -> Element<'_, Message> {
         match self.outputs.has(id) {
             Some(HasOutput::Main) => {
-                if !self.visible {
+                if !self.outputs.bar_is_shown() {
                     return Row::new().into();
                 }
 
                 let [left, center, right] = self.modules_section(id);
 
-                let (space, bar_style, bar_position, opacity, menu, animations_enabled) =
+                let (space, bar_surface, menu, animations_enabled, bar_radius, blur, bar_layout) =
                     use_theme(|t| {
                         (
                             t.space,
-                            t.bar_style,
-                            t.bar_position,
-                            t.opacity,
+                            t.bar_surface,
                             t.menu,
                             t.animations_enabled,
+                            t.bar_border_radius(),
+                            t.surface(Surface::Bar).blur,
+                            t.bar_layout(),
                         )
                     });
                 let centerbox = Centerbox::new([left, center, right])
@@ -684,56 +668,14 @@ impl App {
                     .spacing(space.xxs)
                     .width(Length::Fill)
                     .align_items(Alignment::Center)
-                    .height(if bar_style == AppearanceStyle::Islands {
-                        HEIGHT
-                    } else {
-                        HEIGHT - space.xs as f64
-                    } as f32)
-                    .padding(if bar_style == AppearanceStyle::Islands {
-                        [space.xxs, space.xxs]
-                    } else {
-                        [0.0, 0.0]
-                    });
+                    .height((HEIGHT + bar_layout.vertical_padding()) as f32)
+                    .padding(bar_layout.padding());
 
                 let menu_is_open = self.outputs.menu_is_open();
-                let status_bar = container(centerbox).style(move |t: &Theme| container::Style {
-                    background: match bar_style {
-                        AppearanceStyle::Gradient => Some({
-                            let start_color = t.palette().background.scale_alpha(opacity);
-
-                            let start_color = if menu_is_open {
-                                darken_color(start_color, menu.backdrop)
-                            } else {
-                                start_color
-                            };
-
-                            let end_color = if menu_is_open {
-                                backdrop_color(menu.backdrop)
-                            } else {
-                                Color::TRANSPARENT
-                            };
-
-                            Gradient::Linear(
-                                Linear::new(Radians(PI))
-                                    .add_stop(
-                                        0.0,
-                                        match bar_position {
-                                            Position::Top => start_color,
-                                            Position::Bottom => end_color,
-                                        },
-                                    )
-                                    .add_stop(
-                                        1.0,
-                                        match bar_position {
-                                            Position::Top => end_color,
-                                            Position::Bottom => start_color,
-                                        },
-                                    ),
-                            )
-                            .into()
-                        }),
-                        AppearanceStyle::Solid => Some({
-                            let bg = t.palette().background.scale_alpha(opacity);
+                let bar_style = move |t: &Theme| container::Style {
+                    background: match bar_surface {
+                        BarSurface::Solid => Some({
+                            let bg = t.palette().background;
                             if menu_is_open {
                                 darken_color(bg, menu.backdrop)
                             } else {
@@ -741,7 +683,7 @@ impl App {
                             }
                             .into()
                         }),
-                        AppearanceStyle::Islands => {
+                        BarSurface::Transparent => {
                             if menu_is_open {
                                 Some(backdrop_color(menu.backdrop).into())
                             } else {
@@ -749,15 +691,25 @@ impl App {
                             }
                         }
                     },
+                    border: iced::Border {
+                        radius: bar_radius,
+                        ..Default::default()
+                    },
                     ..Default::default()
-                });
+                };
+                // In Transparent the individual module groups carry the blur.
+                let status_bar: Element<'_, Message> = if blur && bar_surface == BarSurface::Solid {
+                    blur_container(centerbox).style(bar_style).into()
+                } else {
+                    container(centerbox).style(bar_style).into()
+                };
 
                 if self.outputs.menu_is_open() {
                     mouse_area(status_bar)
                         .on_release(Message::CloseMenu(id))
                         .into()
                 } else {
-                    status_bar.into()
+                    status_bar
                 }
             }
             Some(HasOutput::Menu(Some(open_menu))) => {
@@ -782,16 +734,25 @@ impl App {
                         self.notifications.menu_view().map(Message::Notifications),
                         ui_ref,
                     ),
-                    MenuType::Settings => self.menu_wrapper(
-                        id,
-                        self.settings
-                            .menu_view(id, use_theme(|t| t.bar_position))
-                            .map(Message::Settings),
-                        ui_ref,
-                    ),
+                    MenuType::Settings => {
+                        let dnd = self
+                            .general_config
+                            .modules
+                            .contains(&ModuleName::Notifications)
+                            .then(|| self.notifications.dnd());
+                        self.menu_wrapper(
+                            id,
+                            self.settings
+                                .menu_view(id, use_theme(|t| t.bar_position), dnd)
+                                .map(Message::Settings),
+                            ui_ref,
+                        )
+                    }
                     MenuType::MediaPlayer => self.menu_wrapper(
                         id,
-                        self.media_player.menu_view().map(Message::MediaPlayer),
+                        self.media_player
+                            .menu_view(self.outputs.menu_is_closing(id))
+                            .map(Message::MediaPlayer),
                         ui_ref,
                     ),
                     MenuType::SystemInfo => self.menu_wrapper(
@@ -814,6 +775,18 @@ impl App {
                             .map(Message::Settings),
                         ui_ref,
                     ),
+                    MenuType::CustomTooltip(name) => self.menu_wrapper(
+                        id,
+                        self.custom
+                            .get(name)
+                            .map(|custom| {
+                                custom
+                                    .tooltip_view()
+                                    .map(|msg| Message::Custom(name.clone(), msg))
+                            })
+                            .unwrap_or_else(|| Row::new().into()),
+                        ui_ref,
+                    ),
                 }
             }
             Some(HasOutput::Menu(None)) => Row::new().into(),
@@ -834,18 +807,25 @@ impl App {
                 _ => Message::None,
             }),
             iced::output_events().map(Message::OutputEvent),
-            listen_with(move |evt, _, _| match evt {
-                iced::event::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
-                    debug!("Keyboard event received: {key:?}");
-                    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-                        debug!("ESC key pressed, closing all menus");
-                        Some(Message::CloseAllMenus)
-                    } else {
-                        None
+            // Only listen while Escape can close a menu; an idle listener
+            // subscription still receives every interaction event and would
+            // overflow iced's fixed-size event channel for nothing.
+            if self.general_config.enable_esc_key && self.outputs.menu_is_open() {
+                listen_with(|evt, _, _| match evt {
+                    iced::event::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
+                        debug!("Keyboard event received: {key:?}");
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            debug!("ESC key pressed, closing all menus");
+                            Some(Message::CloseAllMenus)
+                        } else {
+                            None
+                        }
                     }
-                }
-                _ => None,
-            }),
+                    _ => None,
+                })
+            } else {
+                Subscription::none()
+            },
             Subscription::run(|| match signal_hook_tokio::Signals::new([libc::SIGUSR1]) {
                 Ok(signals) => signals
                     .filter_map(|sig| {
@@ -866,8 +846,103 @@ impl App {
             self.settings.subscription().map(Message::Settings),
             crate::ipc::subscription().map(|cmd| match cmd {
                 IpcCommand::ToggleVisibility => Message::ToggleVisibility,
+                IpcCommand::LoadConfig { file } => Message::LoadConfig(file),
                 other => Message::IpcOsdCommand(other),
             }),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modules::custom_module::{CustomListenData, Message as CustomMessage};
+
+    fn test_config(listen_cmd: &str) -> Config {
+        #[derive(serde::Serialize)]
+        struct CustomModuleStub {
+            name: &'static str,
+            listen_cmd: String,
+            #[serde(rename = "type")]
+            module_type: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        struct ConfigStub {
+            #[serde(rename = "CustomModule")]
+            custom_module: Vec<CustomModuleStub>,
+        }
+
+        let stub = ConfigStub {
+            custom_module: vec![CustomModuleStub {
+                name: "probe",
+                listen_cmd: listen_cmd.to_owned(),
+                module_type: "Text",
+            }],
+        };
+        let toml = toml::to_string(&stub).expect("test config should serialize");
+        toml::from_str(&toml).expect("test config should deserialize")
+    }
+
+    fn test_app() -> App {
+        let (_log, logger) = flexi_logger::Logger::with(
+            flexi_logger::LogSpecBuilder::new()
+                .default(log::LevelFilter::Off)
+                .build(),
+        )
+        .log_to_stderr()
+        .build()
+        .expect("logger should build");
+        let (app, _task) = App::new((logger, Config::default(), PathBuf::from("/nonexistent")))();
+        app
+    }
+
+    /// A config save that leaves `name`/`listen_cmd` untouched must not wipe
+    /// the last `listen_cmd` payload: the subscription is keyed on that pair,
+    /// so iced keeps the already-running process alive and it will not reprint.
+    #[test]
+    fn reload_keeps_listen_cmd_data_when_subscription_is_unchanged() {
+        let config = test_config("swaync-client -swb");
+        let mut app = test_app();
+        app.update(Message::ConfigChanged(Box::new(config.clone())));
+
+        app.update(Message::Custom(
+            "probe".to_string(),
+            CustomMessage::Update(CustomListenData {
+                alt: "critical".to_string(),
+                text: Some("3 urgent".to_string()),
+                tooltip: None,
+            }),
+        ));
+
+        app.update(Message::ConfigChanged(Box::new(test_config(
+            "swaync-client -swb",
+        ))));
+
+        let data = app.custom.get("probe").expect("module kept").data();
+        assert_eq!(data.text.as_deref(), Some("3 urgent"));
+        assert_eq!(data.alt, "critical");
+    }
+
+    /// Changing `listen_cmd` restarts the subscription, so stale output from
+    /// the previous command must not leak into the new one.
+    #[test]
+    fn reload_drops_listen_cmd_data_when_listen_cmd_changes() {
+        let mut app = test_app();
+        app.update(Message::ConfigChanged(Box::new(test_config("cmd-a"))));
+
+        app.update(Message::Custom(
+            "probe".to_string(),
+            CustomMessage::Update(CustomListenData {
+                alt: "critical".to_string(),
+                text: Some("stale".to_string()),
+                tooltip: None,
+            }),
+        ));
+
+        app.update(Message::ConfigChanged(Box::new(test_config("cmd-b"))));
+
+        let data = app.custom.get("probe").expect("module kept").data();
+        assert!(data.text.is_none(), "stale text survived: {:?}", data.text);
+        assert!(data.alt.is_empty(), "stale alt survived: {:?}", data.alt);
     }
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use iced::futures::future::join_all;
-use log::{debug, error};
+use log::{debug, error, warn};
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -11,7 +11,8 @@ use crate::{
         ButtonUIRef, MenuSize, collapsible,
         icons::{DynamicIcon, Icon, StaticIcon, icon, icon_button},
         menu::MenuType,
-        password_dialog, position_button, quick_setting_button, sub_menu_wrapper,
+        password_dialog, position_button, quick_setting_button, share_wifi_dialog,
+        sub_menu_wrapper,
     },
     config::{Position, SettingsCustomButton, SettingsIndicator, SettingsModuleConfig},
     modules::settings::{
@@ -23,11 +24,11 @@ use crate::{
     },
     services::idle_inhibitor::IdleInhibitorManager,
     t,
-    theme::use_theme,
+    theme::{transparent_button_style, use_theme},
 };
 use iced::{
-    Border, Color, Element, Length, Shadow, Subscription, SurfaceId, Task, Theme, Vector,
-    widget::{Column, Row, Space, container, row, space},
+    Element, Length, Subscription, SurfaceId, Task, Theme,
+    widget::{Column, Row, Space, container, image, row, space},
 };
 
 pub(crate) mod audio;
@@ -47,6 +48,7 @@ pub struct Settings {
     network: NetworkSettings,
     bluetooth: BluetoothSettings,
     idle_inhibitor: Option<IdleInhibitorManager>,
+    remove_dnd_btn: bool,
     sub_menu: Option<SubMenu>,
     network_dialog: Option<NetworkDialogState>,
     network_dialog_show_password: bool,
@@ -57,34 +59,25 @@ pub struct Settings {
 }
 
 #[derive(Debug, Clone)]
-enum NetworkDialogKind {
-    Password,
-    OpenNetworkWarning,
+enum NetworkDialogState {
+    Password {
+        ssid: String,
+        password: String,
+    },
+    OpenNetworkWarning {
+        ssid: String,
+        connect_once: bool,
+    },
+    ShareWifi {
+        ssid: String,
+        password: Option<String>,
+        error: Option<String>,
+        qr: Option<(image::Handle, u32)>,
+    },
 }
 
-#[derive(Debug, Clone)]
-struct NetworkDialogState {
-    ssid: String,
-    password: Option<String>,
-    kind: NetworkDialogKind,
-}
-
-impl NetworkDialogState {
-    fn new_password_dialog(ssid: String) -> Self {
-        Self {
-            ssid,
-            password: Some(String::new()),
-            kind: NetworkDialogKind::Password,
-        }
-    }
-
-    fn new_warning_dialog(ssid: String) -> Self {
-        Self {
-            ssid,
-            password: None,
-            kind: NetworkDialogKind::OpenNetworkWarning,
-        }
-    }
+fn focus_password_input() -> Task<Message> {
+    iced::widget::focus::<Message>(password_dialog::PASSWORD_INPUT_ID).into()
 }
 
 #[derive(Debug, Clone)]
@@ -94,14 +87,16 @@ pub enum Message {
     Audio(audio::Message),
     Brightness(brightness::Message),
     ToggleInhibitIdle,
-    Lock,
+    ToggleDnd,
+    Lock(SurfaceId),
     Power(power::Message),
     ToggleSubMenu(SubMenu),
     PasswordDialog(password_dialog::Message),
+    ShareDialog(share_wifi_dialog::Message),
     CustomButton(String),
     CustomButtonsStatus(Vec<(String, Option<bool>)>),
     MenuOpened,
-    ConfigReloaded(SettingsModuleConfig),
+    ConfigReloaded(Box<SettingsModuleConfig>),
     AudioTooltipHover(ButtonUIRef, SurfaceId),
     BluetoothTooltipHover(ButtonUIRef, SurfaceId),
     WifiTooltipHover(ButtonUIRef, SurfaceId),
@@ -115,16 +110,17 @@ pub enum Action {
     None,
     Command(Task<Message>),
     CloseMenu(SurfaceId),
-    RequestKeyboard(SurfaceId),
+    RequestKeyboardWithCommand(SurfaceId, Task<Message>),
     ReleaseKeyboard(SurfaceId),
     ReleaseKeyboardWithCommand(SurfaceId, Task<Message>),
     OpenTooltipMenu(SurfaceId, MenuType, ButtonUIRef),
     CloseTooltipMenu(SurfaceId, MenuType),
+    ToggleDnd,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum SubMenu {
-    PeripheralMenu,
+    BatteryMenu,
     Power,
     Sinks,
     Sources,
@@ -210,10 +206,14 @@ impl Settings {
                 config.peripheral_indicators,
                 config.peripheral_battery_format,
                 config.peripheral_expanded_by_default,
+                config.battery_health,
+                config.keyboard_backlight_slider,
             )),
             audio: AudioSettings::new(AudioSettingsConfig::new(
                 config.audio_sinks_more_cmd,
                 config.audio_sources_more_cmd,
+                config.audio_sink_post_switch_cmd,
+                config.audio_source_post_switch_cmd,
                 config.volume_step,
                 config.max_volume,
                 config.audio_indicator_format,
@@ -235,6 +235,7 @@ impl Settings {
             } else {
                 IdleInhibitorManager::new()
             },
+            remove_dnd_btn: config.remove_dnd_btn,
             sub_menu: None,
             network_dialog: None,
             indicators: config.indicators,
@@ -263,11 +264,12 @@ impl Settings {
         match message {
             Message::Power(msg) => match self.power.update(msg) {
                 power::Action::None => Action::None,
-                power::Action::TogglePeripheralMenu => {
-                    self.toggle_submenu_to(SubMenu::PeripheralMenu);
+                power::Action::ToggleBatteryMenu => {
+                    self.toggle_submenu_to(SubMenu::BatteryMenu);
                     Action::None
                 }
                 power::Action::Command(task) => Action::Command(task.map(Message::Power)),
+                power::Action::CloseMenu(id) => Action::CloseMenu(id),
             },
             Message::Audio(msg) => match self.audio.update(msg) {
                 audio::Action::None => Action::None,
@@ -293,18 +295,40 @@ impl Settings {
             Message::Network(msg) => match self.network.update(msg) {
                 network::Action::None => Action::None,
                 network::Action::RequestPasswordForSSID(ssid) => {
-                    self.network_dialog = Some(NetworkDialogState::new_password_dialog(ssid));
+                    self.network_dialog = Some(NetworkDialogState::Password {
+                        ssid,
+                        password: String::new(),
+                    });
+                    self.network_dialog_show_password = false;
+                    Action::Command(focus_password_input())
+                }
+                network::Action::RequestPassword(id, ssid) => {
+                    self.network_dialog = Some(NetworkDialogState::Password {
+                        ssid,
+                        password: String::new(),
+                    });
+                    self.network_dialog_show_password = false;
+                    Action::RequestKeyboardWithCommand(id, focus_password_input())
+                }
+                network::Action::ConfirmOpenNetwork(ssid) => {
+                    self.network_dialog = Some(NetworkDialogState::OpenNetworkWarning {
+                        ssid,
+                        connect_once: false,
+                    });
                     self.network_dialog_show_password = false;
                     Action::None
                 }
-                network::Action::RequestPassword(id, ssid) => {
-                    self.network_dialog = Some(NetworkDialogState::new_password_dialog(ssid));
-                    self.network_dialog_show_password = false;
-                    Action::RequestKeyboard(id)
-                }
-                network::Action::ConfirmOpenNetwork(ssid) => {
-                    self.network_dialog = Some(NetworkDialogState::new_warning_dialog(ssid));
-                    self.network_dialog_show_password = false;
+                network::Action::OpenShareWifiDialog { ssid, outcome } => {
+                    let (password, error, qr_payload) =
+                        share_wifi_dialog::materialize(&ssid, outcome);
+                    self.network_dialog = Some(NetworkDialogState::ShareWifi {
+                        qr: qr_payload
+                            .as_deref()
+                            .and_then(share_wifi_dialog::qr_image_handle),
+                        ssid,
+                        password,
+                        error,
+                    });
                     Action::None
                 }
                 network::Action::Command(task) => Action::Command(task.map(Message::Network)),
@@ -362,16 +386,19 @@ impl Settings {
                 }
                 Action::None
             }
-            Message::Lock => {
+            Message::ToggleDnd => Action::ToggleDnd,
+            Message::Lock(id) => {
                 if let Some(lock_cmd) = &self.lock_cmd {
                     crate::utils::launcher::execute_command(lock_cmd);
                 }
-                Action::None
+                Action::CloseMenu(id)
             }
             Message::PasswordDialog(msg) => match msg {
                 password_dialog::Message::PasswordChanged(password) => {
-                    if let Some(dialog) = &mut self.network_dialog {
-                        dialog.password = Some(password);
+                    if let Some(NetworkDialogState::Password { password: pw, .. }) =
+                        self.network_dialog.as_mut()
+                    {
+                        *pw = password;
                     }
 
                     Action::None
@@ -381,28 +408,41 @@ impl Settings {
 
                     Action::None
                 }
-                password_dialog::Message::DialogConfirmed(id) => {
-                    let action = if let Some(dialog) = self.network_dialog.take() {
-                        let message = match dialog.kind {
-                            NetworkDialogKind::Password => {
-                                network::Message::PasswordDialogConfirmed(
-                                    dialog.ssid,
-                                    dialog.password.unwrap_or_default(),
-                                )
-                            }
-                            NetworkDialogKind::OpenNetworkWarning => {
-                                network::Message::OpenNetworkDialogConfirmed(dialog.ssid)
-                            }
-                        };
+                password_dialog::Message::ConnectOnceToggled(connect_once) => {
+                    if let Some(NetworkDialogState::OpenNetworkWarning {
+                        connect_once: value,
+                        ..
+                    }) = self.network_dialog.as_mut()
+                    {
+                        *value = connect_once;
+                    }
 
-                        match self.network.update(message) {
-                            network::Action::Command(task) => {
-                                Action::ReleaseKeyboardWithCommand(id, task.map(Message::Network))
-                            }
-                            _ => Action::ReleaseKeyboard(id),
+                    Action::None
+                }
+                password_dialog::Message::DialogConfirmed(id) => {
+                    let message = match self.network_dialog.take() {
+                        Some(NetworkDialogState::Password { ssid, password }) => {
+                            Some(network::Message::PasswordDialogConfirmed(ssid, password))
                         }
-                    } else {
-                        Action::ReleaseKeyboard(id)
+                        Some(NetworkDialogState::OpenNetworkWarning { ssid, connect_once }) => {
+                            let connect_once = connect_once && self.network.can_connect_once(&ssid);
+                            Some(network::Message::OpenNetworkDialogConfirmed(
+                                ssid,
+                                connect_once,
+                            ))
+                        }
+                        Some(NetworkDialogState::ShareWifi { .. }) => {
+                            warn!("Ignoring password confirmation from the share Wi-Fi dialog");
+                            None
+                        }
+                        None => None,
+                    };
+
+                    let action = match message.map(|message| self.network.update(message)) {
+                        Some(network::Action::Command(task)) => {
+                            Action::ReleaseKeyboardWithCommand(id, task.map(Message::Network))
+                        }
+                        _ => Action::ReleaseKeyboard(id),
                     };
                     self.network_dialog_show_password = false;
                     action
@@ -412,6 +452,12 @@ impl Settings {
                     self.network_dialog_show_password = false;
 
                     Action::ReleaseKeyboard(id)
+                }
+            },
+            Message::ShareDialog(msg) => match msg {
+                share_wifi_dialog::Message::Close => {
+                    self.network_dialog = None;
+                    Action::None
                 }
             },
             Message::CustomButton(name) => {
@@ -431,8 +477,11 @@ impl Settings {
                 Action::None
             }
             Message::MenuOpened => {
+                self.network_dialog = None;
+                self.network_dialog_show_password = false;
+
                 self.sub_menu = if self.power.config.peripheral_expanded_by_default {
-                    Some(SubMenu::PeripheralMenu)
+                    Some(SubMenu::BatteryMenu)
                 } else {
                     None
                 };
@@ -479,7 +528,7 @@ impl Settings {
                                         }
                                     }
                                 } else {
-                                    (button.name, Some(false))
+                                    (button.name, None)
                                 }
                             });
                             join_all(futures).await
@@ -507,11 +556,15 @@ impl Settings {
                         config.peripheral_indicators,
                         config.peripheral_battery_format,
                         config.peripheral_expanded_by_default,
+                        config.battery_health,
+                        config.keyboard_backlight_slider,
                     )));
                 self.audio
                     .update(audio::Message::ConfigReloaded(AudioSettingsConfig::new(
                         config.audio_sinks_more_cmd,
                         config.audio_sources_more_cmd,
+                        config.audio_sink_post_switch_cmd,
+                        config.audio_source_post_switch_cmd,
                         config.volume_step,
                         config.max_volume,
                         config.audio_indicator_format,
@@ -539,6 +592,7 @@ impl Settings {
                 } else if self.idle_inhibitor.is_none() {
                     self.idle_inhibitor = IdleInhibitorManager::new();
                 }
+                self.remove_dnd_btn = config.remove_dnd_btn;
                 self.indicators = config.indicators;
                 self.custom_buttons = config.custom_buttons;
                 Action::None
@@ -565,17 +619,45 @@ impl Settings {
         }
     }
 
-    pub fn menu_view<'a>(&'a self, id: SurfaceId, position: Position) -> Element<'a, Message> {
+    pub fn menu_view<'a>(
+        &'a self,
+        id: SurfaceId,
+        position: Position,
+        dnd: Option<bool>,
+    ) -> Element<'a, Message> {
         let space = use_theme(|t| t.space);
         container(if let Some(dialog) = &self.network_dialog {
-            password_dialog::view(
-                id,
-                &dialog.ssid,
-                dialog.password.as_deref().unwrap_or(""),
-                self.network_dialog_show_password,
-                matches!(dialog.kind, NetworkDialogKind::OpenNetworkWarning),
-            )
-            .map(Message::PasswordDialog)
+            match dialog {
+                NetworkDialogState::Password { ssid, password } => password_dialog::view(
+                    id,
+                    ssid,
+                    password,
+                    self.network_dialog_show_password,
+                    false,
+                    false,
+                    false,
+                )
+                .map(Message::PasswordDialog),
+                NetworkDialogState::OpenNetworkWarning { ssid, connect_once } => {
+                    password_dialog::view(
+                        id,
+                        ssid,
+                        "",
+                        self.network_dialog_show_password,
+                        true,
+                        self.network.can_connect_once(ssid),
+                        *connect_once,
+                    )
+                    .map(Message::PasswordDialog)
+                }
+                NetworkDialogState::ShareWifi {
+                    ssid,
+                    password,
+                    error,
+                    qr,
+                } => share_wifi_dialog::view(ssid, password.clone(), error.clone(), qr.clone())
+                    .map(Message::ShareDialog),
+            }
         } else {
             let battery_data = self
                 .power
@@ -585,7 +667,7 @@ impl Settings {
                 .push(
                     self.lock_cmd
                         .as_ref()
-                        .map(|_| icon_button(StaticIcon::Lock).on_press(Message::Lock)),
+                        .map(|_| icon_button(StaticIcon::Lock).on_press(Message::Lock(id))),
                 )
                 .push(
                     icon_button(if self.sub_menu == Some(SubMenu::Power) {
@@ -649,6 +731,26 @@ impl Settings {
                                 Message::ToggleInhibitIdle,
                                 None,
                                 None,
+                                None,
+                            ),
+                            None,
+                        )
+                    }),
+                    dnd.filter(|_| !self.remove_dnd_btn).map(|active| {
+                        (
+                            quick_setting_button(
+                                if active {
+                                    StaticIcon::BellOff
+                                } else {
+                                    StaticIcon::Bell
+                                },
+                                t!("settings-dnd"),
+                                None,
+                                active,
+                                Message::ToggleDnd,
+                                None,
+                                None,
+                                None,
                             ),
                             None,
                         )
@@ -680,6 +782,7 @@ impl Settings {
                             Message::CustomButton(button.name.clone()),
                             None,
                             None,
+                            None,
                         ),
                         None,
                     )
@@ -693,10 +796,10 @@ impl Settings {
             let header_group = {
                 let mut col = Column::<'a, Message>::with_capacity(3).spacing(0);
                 col = col.push(header);
-                if let Some(e) = self.power.peripheral_menu() {
+                if let Some(e) = self.power.battery_menu() {
                     col = col.push(
                         collapsible(
-                            self.sub_menu == Some(SubMenu::PeripheralMenu),
+                            self.sub_menu == Some(SubMenu::BatteryMenu),
                             sub_menu_wrapper(e.map(Message::Power)),
                         )
                         .animated(animated)
@@ -706,7 +809,7 @@ impl Settings {
                 col = col.push(
                     collapsible(
                         self.sub_menu == Some(SubMenu::Power),
-                        sub_menu_wrapper(self.power.menu().map(Message::Power)),
+                        sub_menu_wrapper(self.power.menu(id).map(Message::Power)),
                     )
                     .animated(animated)
                     .open_padding_top(space.md),
@@ -745,6 +848,11 @@ impl Settings {
                 .push(audio_sinks_group)
                 .push(audio_sources_group)
                 .push(self.brightness.slider().map(|e| e.map(Message::Brightness)))
+                .push(
+                    self.power
+                        .kbd_backlight_slider()
+                        .map(|e| e.map(Message::Power)),
+                )
                 .push(quick_settings)
                 .spacing(space.md)
                 .into()
@@ -882,7 +990,7 @@ impl Settings {
     }
 
     pub fn tooltip_view<'a>(&'a self, menu_type: &MenuType) -> Element<'a, Message> {
-        let space = use_theme(|t| t.space);
+        let (space, font_size) = use_theme(|t| (t.space, t.font_size));
         let fallback = |label: String| -> Element<'a, Message> { iced::widget::text(label).into() };
         match menu_type {
             MenuType::AudioTooltip => {
@@ -930,9 +1038,17 @@ impl Settings {
             }
             MenuType::WifiTooltip => {
                 if let Some(label) = self.network.connected_wifi_label() {
-                    row![StaticIcon::Wifi4.to_text(), iced::widget::text(label)]
-                        .spacing(space.xs)
-                        .into()
+                    let band = self.network.connected_wifi_band();
+                    let mut r = row![StaticIcon::Wifi4.to_text(), iced::widget::text(label)]
+                        .spacing(space.xs);
+                    if let Some(b) = band {
+                        r = r.push(iced::widget::text(b).size(font_size.xs).style(
+                            |theme: &Theme| iced::widget::text::Style {
+                                color: Some(theme.palette().primary),
+                            },
+                        ));
+                    }
+                    r.into()
                 } else {
                     fallback(t!("settings-tooltip-empty-wifi"))
                 }
@@ -947,7 +1063,13 @@ impl Settings {
                 }
             }
             MenuType::BatteryTooltip => {
-                if let Some((capacity, status_label, details)) = self.power.battery_tooltip_info() {
+                if let Some(power::BatteryTooltipInfo {
+                    capacity,
+                    status_label,
+                    details,
+                    health_lines,
+                }) = self.power.battery_tooltip_info()
+                {
                     let mut r = Row::new()
                         .push(StaticIcon::Battery4.to_text())
                         .push(iced::widget::text(format!("{capacity}%")))
@@ -956,7 +1078,15 @@ impl Settings {
                     if !details.is_empty() {
                         r = r.push(iced::widget::text(details));
                     }
-                    r.into()
+                    Column::new()
+                        .push(r)
+                        .extend(health_lines.into_iter().map(|(icon_kind, line)| {
+                            row![icon_kind.to_text(), iced::widget::text(line)]
+                                .spacing(space.xs)
+                                .into()
+                        }))
+                        .spacing(space.xs)
+                        .into()
                 } else {
                     fallback(t!("settings-tooltip-empty-battery"))
                 }
@@ -978,27 +1108,6 @@ impl Settings {
             }
             _ => fallback(t!("settings-tooltip-empty")),
         }
-    }
-}
-
-fn transparent_button_style(
-    theme: &Theme,
-    _status: iced::widget::button::Status,
-) -> iced::widget::button::Style {
-    iced::widget::button::Style {
-        background: None,
-        border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.,
-            radius: 0.into(),
-        },
-        shadow: Shadow {
-            color: Color::TRANSPARENT,
-            offset: Vector::default(),
-            blur_radius: 0.,
-        },
-        text_color: theme.palette().text,
-        snap: true,
     }
 }
 

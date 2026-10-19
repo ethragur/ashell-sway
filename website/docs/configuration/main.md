@@ -7,59 +7,83 @@ sidebar_position: 1
 This page contains the base configuration options for Ashell.
 
 It allows you to configure things like the log level, the monitor(s) used to
-render the status bar, and the bar’s position.
+render the status bar, and the bar's position.
 
 All these configurations are defined in the root of the `toml` file.
 
-## Log Level
+## Logging
 
-The log level controls the verbosity of logs.
+The `[logging]` section controls log level, destination, and file location.
 
-You can set it to a general level like `debug`, `info`, `warn`, or `error`,
-or specify fine-grained control to enable logs from specific modules
-in the codebase, e.g., `ashell::services::network=debug`.
+By default, ashell logs at `warn` level to a file directly inside
+`$XDG_RUNTIME_DIR`, for example `/run/user/1000/ashell_rCURRENT.log`. When
+`$XDG_RUNTIME_DIR` is unset or is not a private per-user directory, the
+fallback is `$TMPDIR/ashell-<uid>/` (typically `/tmp/ashell-1000/`), created
+with mode `0700`. If that directory exists but is not yours with mode `0700`,
+ashell logs to stderr instead. Log files are rotated daily or when they reach
+10 MB, and the last 7 files are kept.
 
-See more about [log levels](https://docs.rs/env_logger/latest/env_logger/#enabling-logging).
+See [log levels](https://docs.rs/env_logger/latest/env_logger/#enabling-logging)
+for the full filter syntax.
+
+### Options
+
+- `level` sets the log verbosity: `"error"`, `"warn"`, `"info"`, or `"debug"` (default: `"warn"`).
+- `target` sets where to write logs: `"file"` (default), `"stdout"`, or `"stderr"`.
+- `directory` sets a custom log directory (only used when `target = "file"`).
+  Supports `~` and environment variable expansion, and is created if missing.
+  Defaults to `$XDG_RUNTIME_DIR`.
 
 :::warning
 
-This configuration **requires** restarting Ashell to take effect.
+Changing the `[logging]` section requires restarting ashell to take effect.
+The log destination is set once at startup and cannot be changed via hot-reload.
 
 :::
 
-### Log Examples
+:::caution
 
-Set the global log level to `debug` for all modules:
+On multi-user systems, avoid setting `directory` to a shared path like `/tmp/ashell`.
+ashell does not check the ownership or mode of a `directory` you set yourself.
+The default directories are private to your user.
 
-```toml
-log_level = "debug"
-```
+:::
 
-Set the log level for the `ashell` module only:
-
-```toml
-log_level = "ashell=debug"
-```
-
-Set the log level to `warn` for all modules, `info` for Ashell modules,
-and `debug` only for the network service:
+### Examples
 
 ```toml
-log_level = "warn,ashell=info,ashell::services::network=debug"
+[logging]
+level = "debug"
 ```
 
-To understand all possible module names you can use, check
-the [source code](https://github.com/MalpenZibo/ashell).  
-The `src` folder is the root of the `ashell` module, and every directory
-or file under it declares a module or submodule.
+```toml
+[logging]
+level = "warn,ashell=info,ashell::services::network=debug"
+```
 
-For example, the file `src/modules/media_player.rs` maps to the module `ashell::modules::media_player`.
+```toml
+[logging]
+target = "stdout"
+```
+
+```toml
+[logging]
+target = "file"
+directory = "~/.local/log/ashell"
+```
+
+The `level` option supports fine-grained control per Rust module, e.g.
+`"warn,ashell::services::network=debug"`. To understand all possible module
+names, check the [source code](https://github.com/MalpenZibo/ashell). The `src`
+folder is the root of the `ashell` module, and every directory or file under it
+declares a module or submodule. For example, `src/modules/media_player.rs` maps
+to `ashell::modules::media_player`.
 
 :::warning
 
-Don’t confuse Ashell features (called “modules”) with Rust modules
-(defined with `mod.rs` or in files).  
-In this configuration, we're referring to Rust modules.
+Don't confuse Ashell features (called "modules") with Rust modules
+(defined with `mod.rs` or in files). In this configuration, we're
+referring to Rust modules.
 
 :::
 
@@ -75,13 +99,43 @@ Ashell supports localization through two independent root-level options.
 Both accept a BCP-47 / POSIX-style locale identifier (e.g. `"en-US"`, `"it-IT"`).
 They are optional and fall back to your environment: `language` resolves from
 `$LC_ALL`, then `$LC_MESSAGES`, then `$LANG`, and `region` resolves from
-`$LC_ALL`, then `$LC_TIME`, then `$LANG`. The unit system additionally honors
-`$LC_MEASUREMENT` when set. If nothing matches, ashell defaults to `en-US`.
+`$LC_ALL`, then `$LC_TIME`, then `$LANG`. The unit system resolves from
+`region`, then `$LC_ALL`, then `$LC_MEASUREMENT`, then `$LANG`; if none of them
+is set it follows the date/time locale.
+
+When nothing matches, the two options fall back separately: `language` falls
+back to `en-US`, and `region` falls back to `en-GB` (so dates use day/month
+ordering and the unit system is metric).
 
 ```toml
 language = "en-US"   # UI language
 region   = "it-IT"   # date format + unit system
 ```
+
+### Available translations
+
+ashell currently ships UI translations for:
+
+- `en-US` (also the fallback for any unmatched language)
+- `de-DE`
+- `fr-FR`
+- `ru-RU`
+- `uk-UA`
+
+Setting `language` to anything else is not an error; untranslated strings just
+fall back to English. `region` is not restricted to this list: it accepts any
+locale the `chrono` crate knows, so you can pair an English UI with, say,
+Italian date formatting.
+
+### Unit system
+
+`region` (or `$LC_MEASUREMENT`) selects imperial units only for `en_US`,
+`en_LR` and `my_MM`. Every other locale, including `en-GB`, resolves to metric.
+Imperial means Fahrenheit for temperatures and mph for wind speed.
+
+Individual modules can opt out of the unit system: see
+[`system_info.temperature.units`](./modules/system_info.md#temperature) and
+[`tempo.wind_speed_unit`](./modules/tempo.md).
 
 ## Outputs
 
@@ -109,6 +163,14 @@ Render the status bar on a specific list of monitors:
 ```toml
 outputs = { Targets = ["DP-1", "eDP-1"] }
 ```
+
+Targets match connector names or case-sensitive substrings of the combined
+`name make model` and compositor-provided Wayland description.
+
+Wayland descriptions have no standard format and may differ from labels shown by
+`hyprctl monitors` or `niri msg outputs`. Use `wayland-info` to inspect the
+advertised descriptions, preserving their spacing and punctuation in your targets.
+Serial-number targets only work when the serial is included in the Wayland description.
 
 ## Position & Layer
 
@@ -171,6 +233,18 @@ Alternatively, you can still use a `SIGUSR1` signal:
 ```bash
 kill -SIGUSR1 $(pidof ashell)
 ```
+
+## Config Load
+
+You can load another config file, this can be useful for managing different themes
+
+```bash
+ashell msg load-config ~/.config/ashell/mac_bar.toml
+```
+
+### Notes
+- Switching configurations, won't save them as default. Ashell will start with the default config (`config.toml`) or the one passed with `--config-path` at startup.
+- Hot reloading will not change the font configuration. A full restart of ashell will be needed for font changes.
 
 ## OSD (On-Screen Display)
 

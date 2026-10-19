@@ -1,4 +1,10 @@
+// To add a backend: expose `is_available`/`run_listener`/`execute_command` from
+// a module (see `hyprland`/`niri`/`generic`), add a `CompositorChoice` variant,
+// and wire it into `detect_backend`, `broadcaster_event_loop` and
+// `execute_command` below.
+pub mod generic;
 pub mod hyprland;
+pub mod mangowc;
 pub mod niri;
 pub mod sway;
 pub mod types;
@@ -10,6 +16,7 @@ pub use self::types::{
 use crate::services::{ReadOnlyService, Service, ServiceEvent};
 use iced::futures::SinkExt;
 use iced::{Subscription, Task, stream::channel};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{any::TypeId, ops::Deref, sync::OnceLock};
 use tokio::sync::{OnceCell, broadcast};
 
@@ -19,6 +26,16 @@ static BROADCASTER: OnceCell<broadcast::Sender<ServiceEvent<CompositorService>>>
     OnceCell::const_new();
 
 static BACKEND: OnceLock<Option<CompositorChoice>> = OnceLock::new();
+
+static COLLECT_WINDOW_CLASSES: AtomicBool = AtomicBool::new(false);
+
+pub fn set_collect_window_classes(enabled: bool) {
+    COLLECT_WINDOW_CLASSES.store(enabled, Ordering::Relaxed);
+}
+
+pub fn should_collect_window_classes() -> bool {
+    COLLECT_WINDOW_CLASSES.load(Ordering::Relaxed)
+}
 
 /// Subscribe to compositor events.  Initializes the broadcaster on first call.
 async fn broadcaster_subscribe() -> broadcast::Receiver<ServiceEvent<CompositorService>> {
@@ -47,6 +64,8 @@ async fn broadcaster_event_loop(tx: broadcast::Sender<ServiceEvent<CompositorSer
         CompositorChoice::Hyprland => hyprland::run_listener(&tx).await,
         CompositorChoice::Niri => niri::run_listener(&tx).await,
         CompositorChoice::Sway => sway::run_listener(&tx).await,
+        CompositorChoice::Mango => mangowc::run_listener(&tx).await,
+        CompositorChoice::Generic => generic::run_listener(&tx).await,
     };
 
     if let Err(e) = result {
@@ -63,6 +82,14 @@ fn detect_backend() -> Option<CompositorChoice> {
             Some(CompositorChoice::Niri)
         } else if sway::is_available() {
             Some(CompositorChoice::Sway)
+        } else if mangowc::is_available() {
+            Some(CompositorChoice::Mango)
+        } else if generic::is_available() {
+            log::info!(
+                "No dedicated compositor detected; using the generic Wayland backend. \
+                 If you are on Hyprland or Niri, check that its environment variables are exported."
+            );
+            Some(CompositorChoice::Generic)
         } else {
             None
         }
@@ -144,6 +171,35 @@ impl Service for CompositorService {
     }
 }
 
+pub async fn focus_app_window(
+    pid: Option<u32>,
+    apps: Vec<String>,
+    title: Option<String>,
+) -> Result<(), String> {
+    let backend =
+        detect_backend().ok_or_else(|| "No supported compositor backend found".to_string())?;
+
+    execute_command(
+        backend,
+        CompositorCommand::FocusAppWindow { pid, apps, title },
+    )
+    .await
+}
+
+/// Whether a window `title` shows `wanted`, e.g. a browser window whose active
+/// tab plays the media titled `wanted`.
+fn title_matches(title: Option<&str>, wanted: Option<&str>) -> bool {
+    match (title, wanted) {
+        (Some(title), Some(wanted)) if !wanted.is_empty() => title.contains(wanted),
+        _ => false,
+    }
+}
+
+/// Whether a window's app id or class is one of `apps`.
+fn app_matches(app: Option<&str>, apps: &[String]) -> bool {
+    app.is_some_and(|app| apps.iter().any(|a| a.eq_ignore_ascii_case(app)))
+}
+
 async fn execute_command(
     backend: CompositorChoice,
     command: CompositorCommand,
@@ -152,6 +208,8 @@ async fn execute_command(
         CompositorChoice::Hyprland => hyprland::execute_command(command).await,
         CompositorChoice::Niri => niri::execute_command(command).await,
         CompositorChoice::Sway => sway::execute_command(command).await,
+        CompositorChoice::Mango => mangowc::execute_command(command).await,
+        CompositorChoice::Generic => generic::execute_command(command).await,
     }
     .map_err(|e| e.to_string())
 }

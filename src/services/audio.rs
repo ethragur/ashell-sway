@@ -2,7 +2,7 @@ use super::{ReadOnlyService, Service, ServiceEvent};
 use crate::utils::remote_value::Remote;
 use iced::{
     Subscription, Task,
-    futures::{SinkExt, StreamExt, channel::mpsc::Sender, stream::pending},
+    futures::{SinkExt, channel::mpsc::Sender},
     stream::channel,
 };
 use itertools::Either;
@@ -34,8 +34,12 @@ use std::{
     rc::Rc,
     sync::Arc,
     thread::{self, JoinHandle},
+    time::Duration,
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::{
+    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    time::sleep,
+};
 
 #[derive(Debug, Clone)]
 pub struct Device {
@@ -63,8 +67,12 @@ pub struct Route<'a> {
 impl<'a> fmt::Display for Route<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.port {
-            Some(port) => write!(f, "{}: {}", port.description, self.device.description),
-            None => write!(f, "{}", self.device.description),
+            // The node description already names the port when it is the only one,
+            // so the prefix is only needed to tell apart ports of the same node
+            Some(port) if self.device.ports.len() > 1 => {
+                write!(f, "{}: {}", port.description, self.device.description)
+            }
+            _ => write!(f, "{}", self.device.description),
         }
     }
 }
@@ -204,13 +212,17 @@ impl AudioService {
 
                     State::Active(handle)
                 }
-                None => State::Active(handle),
+                None => {
+                    error!("PulseAudio connection lost");
+                    State::Error
+                }
             },
             State::Error => {
-                error!("Audio service error");
+                error!("Audio service error, retrying in 5 seconds");
 
-                let _ = pending::<u8>().next().await;
-                State::Error
+                sleep(Duration::from_secs(5)).await;
+
+                State::Init
             }
         }
     }
@@ -465,11 +477,13 @@ impl PulseAudioServer {
                 IterateResult::Quit(_) | IterateResult::Err(_) => {
                     return Err(anyhow::anyhow!("PulseAudio: iterate state was not success"));
                 }
-                IterateResult::Success(_) => {
-                    if context.get_state() == context::State::Ready {
-                        break;
+                IterateResult::Success(_) => match context.get_state() {
+                    context::State::Ready => break,
+                    context::State::Failed | context::State::Terminated => {
+                        return Err(anyhow::anyhow!("PulseAudio: connection failed"));
                     }
-                }
+                    _ => {}
+                },
             }
         }
 
@@ -528,6 +542,7 @@ impl PulseAudioServer {
                         Err(e) => {
                             error!("Failed to get server info: {e}");
                             let _ = from_server_tx.send(PulseAudioServerEvent::Error);
+                            return;
                         }
                     };
 
@@ -543,6 +558,7 @@ impl PulseAudioServer {
                         Err(e) => {
                             error!("Failed to get sink info: {e}");
                             let _ = from_server_tx.send(PulseAudioServerEvent::Error);
+                            return;
                         }
                     };
 
@@ -558,10 +574,12 @@ impl PulseAudioServer {
                         Err(e) => {
                             error!("Failed to get source info: {e}");
                             let _ = from_server_tx.send(PulseAudioServerEvent::Error);
+                            return;
                         }
                     };
 
                     let introspector = server.context.introspect();
+                    let error_tx = from_server_tx.clone();
                     server.context.set_subscribe_callback(Some(Box::new(
                         move |_facility, _operation, _idx| {
                             server.introspector.get_server_info({
@@ -617,6 +635,19 @@ impl PulseAudioServer {
                         let data = server.mainloop.iterate(true);
                         if let IterateResult::Quit(_) | IterateResult::Err(_) = data {
                             error!("PulseAudio mainloop error");
+                            let _ = error_tx.send(PulseAudioServerEvent::Error);
+                            break;
+                        }
+
+                        // A server restart (e.g. `systemctl --user restart pipewire`) drops the
+                        // connection without making `iterate` fail: the context just moves out of
+                        // `Ready`. Every context/introspector call below would then get a null
+                        // operation back from libpulse and panic, so bail out and let the
+                        // subscription reconnect instead.
+                        let context_state = server.context.get_state();
+                        if context_state != context::State::Ready {
+                            error!("PulseAudio context is no longer ready: {context_state:?}");
+                            let _ = error_tx.send(PulseAudioServerEvent::Error);
                             break;
                         }
 
@@ -678,11 +709,16 @@ impl PulseAudioServer {
                     error!("PulseAudio: iterate state was not success");
                     return Err(anyhow::anyhow!("PulseAudio: iterate state was not success"));
                 }
-                IterateResult::Success(_) => {
-                    if operation.get_state() == operation::State::Done {
-                        break;
+                IterateResult::Success(_) => match operation.get_state() {
+                    operation::State::Done => break,
+                    // Losing the connection cancels every pending operation. Without this the
+                    // loop would wait for a `Done` that can never arrive.
+                    operation::State::Cancelled => {
+                        error!("PulseAudio: operation was cancelled");
+                        return Err(anyhow::anyhow!("PulseAudio: operation was cancelled"));
                     }
-                }
+                    operation::State::Running => {}
+                },
             }
         }
 
@@ -775,9 +811,11 @@ impl From<&SinkInfo<'_>> for Device {
                 .as_ref()
                 .map_or_else(String::default, |n| n.to_string()),
             description: value
-                .proplist
-                .get_str("device.description")
-                .map_or_else(String::default, |d| d.to_string()),
+                .description
+                .as_ref()
+                .map(|d| d.to_string())
+                .or_else(|| value.proplist.get_str("device.description"))
+                .unwrap_or_default(),
             volume: value.volume,
             is_mute: value.mute,
             is_filter: value.proplist.get_str("node.link-group").is_some(),
@@ -814,9 +852,11 @@ impl From<&SourceInfo<'_>> for Device {
                 .as_ref()
                 .map_or_else(String::default, |n| n.to_string()),
             description: value
-                .proplist
-                .get_str("device.description")
-                .map_or_else(String::default, |d| d.to_string()),
+                .description
+                .as_ref()
+                .map(|d| d.to_string())
+                .or_else(|| value.proplist.get_str("device.description"))
+                .unwrap_or_default(),
             volume: value.volume,
             is_mute: value.mute,
             is_filter: value.proplist.get_str("node.link-group").is_some(),

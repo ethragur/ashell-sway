@@ -1,6 +1,10 @@
 /target
 vendor
 
+# Nix build result symlinks
+/result
+/deps-result
+
 # Local Copr build artifacts
 /copr_build_*/
 
@@ -19,3 +23,8 @@ vendor
 docs/book/
 
 /result
+# generated from CHANGELOG.md by website/scripts/sync-changelog.mjs
+website/src/pages/changelog.md
+
+# IDE
+.vscode/

@@ -8,6 +8,7 @@ pub struct CompositorWorkspace {
     pub windows: u16,
     pub is_special: bool,
     pub has_urgent: bool,
+    pub window_classes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,11 +42,25 @@ pub struct ActiveWindowSway {
     pub address: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ActiveWindowGeneric {
+    pub title: String,
+    pub class: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ActiveWindowMango {
+    pub title: String,
+    pub class: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActiveWindow {
     Hyprland(ActiveWindowHyprland),
     Niri(ActiveWindowNiri),
     Sway(ActiveWindowSway),
+    Generic(ActiveWindowGeneric),
+    Mango(ActiveWindowMango),
 }
 
 impl ActiveWindow {
@@ -54,6 +69,8 @@ impl ActiveWindow {
             ActiveWindow::Hyprland(w) => &w.title,
             ActiveWindow::Niri(w) => &w.title,
             ActiveWindow::Sway(w) => &w.title,
+            ActiveWindow::Generic(w) => &w.title,
+            ActiveWindow::Mango(w) => &w.title,
         }
     }
 
@@ -62,6 +79,8 @@ impl ActiveWindow {
             ActiveWindow::Hyprland(w) => &w.class,
             ActiveWindow::Niri(w) => &w.class,
             ActiveWindow::Sway(w) => &w.class,
+            ActiveWindow::Generic(w) => &w.class,
+            ActiveWindow::Mango(w) => &w.class,
         }
     }
 
@@ -70,6 +89,8 @@ impl ActiveWindow {
             ActiveWindow::Hyprland(w) => Ok(&w.initial_title),
             ActiveWindow::Niri(_) => Err("InitialTitle isn't supported on Niri"),
             ActiveWindow::Sway(_) => Err("InitialTitle isn't supported on Sway"),
+            ActiveWindow::Generic(_) => Err("InitialTitle isn't supported on generic Wayland"),
+            ActiveWindow::Mango(_) => Err("InitialTitle isn't supported on MangoWC"),
         }
     }
 
@@ -78,6 +99,8 @@ impl ActiveWindow {
             ActiveWindow::Hyprland(w) => Ok(&w.initial_class),
             ActiveWindow::Niri(_) => Err("InitialClass isn't supported on Niri"),
             ActiveWindow::Sway(_) => Err("InitialClass isn't supported on Sway"),
+            ActiveWindow::Generic(_) => Err("InitialClass isn't supported on generic Wayland"),
+            ActiveWindow::Mango(_) => Err("InitialClass isn't supported on MangoWC"),
         }
     }
 }
@@ -86,7 +109,9 @@ impl ActiveWindow {
 pub struct CompositorState {
     pub workspaces: Vec<CompositorWorkspace>,
     pub monitors: Vec<CompositorMonitor>,
-    pub active_workspace_id: Option<i32>,
+    // Tag-based compositors (e.g. MangoWC) can have several active workspaces at
+    // once; single-workspace compositors fill this with zero or one id.
+    pub active_workspace_ids: Vec<i32>,
     pub active_window: Option<ActiveWindow>,
     pub keyboard_layout: String,
     pub submap: Option<String>,
@@ -97,6 +122,8 @@ pub enum CompositorChoice {
     Hyprland,
     Niri,
     Sway,
+    Generic,
+    Mango,
 }
 
 #[derive(Debug, Clone)]
@@ -116,10 +143,20 @@ pub enum CompositorEvent {
 #[allow(dead_code)]
 pub enum CompositorCommand {
     FocusWorkspace(i32),
+    FocusNamedWorkspace(String),
     FocusSpecialWorkspace(String),
     FocusMonitor(i128),
     ToggleSpecialWorkspace(String),
     ScrollWorkspace(i32),           // +1 or -1
     CustomDispatch(String, String), // For "vdesk"
     NextLayout,
+    /// Focus a window of an application: one owned by `pid`, or, when none is
+    /// (XWayland or sandboxed apps report another pid), one whose app id or
+    /// class is in `apps`. Among those, prefer the one whose title contains
+    /// `title` (e.g. the browser window showing the tab that plays the media).
+    FocusAppWindow {
+        pid: Option<u32>,
+        apps: Vec<String>,
+        title: Option<String>,
+    },
 }

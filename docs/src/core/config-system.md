@@ -16,7 +16,9 @@ ashell --config-path /path/to/config.toml
 
 ```rust
 pub struct Config {
-    pub log_level: String,                          // Default: "warn"
+    pub logging: LoggingConfig,                     // Level, target and directory
+    pub language: Option<String>,                   // UI language override
+    pub region: Option<String>,                     // Region (formatting) override
     pub position: Position,                         // Top or Bottom
     pub layer: Layer,                               // Top, Bottom, or Overlay
     pub outputs: Outputs,                           // All, Active, or Targets
@@ -26,7 +28,8 @@ pub struct Config {
     pub workspaces: WorkspacesModuleConfig,
     pub window_title: WindowTitleConfig,
     pub system_info: SystemInfoModuleConfig,
-    pub clock: ClockModuleConfig,
+    pub notifications: NotificationsModuleConfig,
+    pub tray: TrayModuleConfig,
     pub tempo: TempoModuleConfig,
     pub settings: SettingsModuleConfig,
     pub appearance: Appearance,
@@ -34,10 +37,31 @@ pub struct Config {
     pub keyboard_layout: KeyboardLayoutModuleConfig,
     pub animations: AnimationsConfig,               // Master toggle for UI animations
     pub enable_esc_key: bool,                       // Default: false
+    pub osd: OsdConfig,                             // On-screen display overlay
 }
 ```
 
-Every field has a serde `#[serde(default)]` attribute, so **an empty config file is valid** — the bar works with zero configuration.
+The struct is marked `#[serde(default)]`, so every field falls back to its default and **an empty config file is valid** — the bar works with zero configuration.
+
+## Logging Bootstrap
+
+The logger must exist before `get_config()` runs, but its destination lives in
+the config file. `config::read_logging_config()` solves this by parsing **only**
+the `[logging]` table into a throwaway wrapper struct, before the logger is
+initialized:
+
+```rust
+pub fn read_logging_config(path: Option<&PathBuf>) -> LoggingConfig
+```
+
+Because it runs before the logger exists it must not use `log::*`; problems are
+reported on `stderr` and it falls back to `LoggingConfig::default()`. Unknown
+top-level keys are skipped without being deserialized, so a broken `[modules]`
+section does not prevent the `[logging]` table from being read. Typos are still
+reported a moment later by the full `Config` parse.
+
+Only `logging.level` is re-applied on hot-reload; `logging.target` and
+`logging.directory` are fixed at startup.
 
 ## Module Layout
 
@@ -59,7 +83,7 @@ pub enum ModuleDef {
 }
 ```
 
-Groups are rendered together in a single container, which is especially visible with the `Islands` bar style.
+Groups are rendered together in a single container, which is especially visible with the `transparent` (islands) bar surface.
 
 ## Hot-Reload
 
@@ -70,7 +94,7 @@ Config changes are detected via [inotify](https://docs.rs/inotify) file watching
 3. `DELETE` events include a 500ms delay before re-reading, to handle atomic save patterns where the file is briefly absent.
 4. On change, the new config is parsed and sent as `Message::ConfigChanged(Box<Config>)`.
 
-The subscription uses `TypeId::of::<Config>()` as its ID to ensure only one watcher runs.
+The subscription is created with `Subscription::run_with(path, ...)`, keyed on the config path, so only one watcher runs per path.
 
 ## Module-Specific Configs
 
@@ -84,8 +108,7 @@ enable_workspace_filling = true
 
 # Tempo clock format
 [tempo]
-format = "%H:%M"
-date_format = "%A, %B %d"
+clock_format = "%a %d %b %R"
 
 # System info thresholds
 [system_info.cpu]
@@ -103,17 +126,24 @@ interval = 3600
 
 ```toml
 [appearance]
-style = "Islands"          # Islands, Solid, or Gradient
-opacity = 0.9
 font_name = "JetBrains Mono"
 scale_factor = 1.0
 
-[appearance.background]
+[appearance.bar]
+surface = "transparent"    # transparent or solid
+radius = "md"              # none|sm|md|lg|xl, CSS border-radius shorthand
+margin = "sm"              # none|xxs..xxl|number(pixels), CSS margin shorthand
+padding = "xxs"            # (default) same values, inset inside the bar
+
+[appearance.opacity]
+default = 0.9
+bar = 1.0
+
+[appearance.background_color]
 base = "#1e1e2e"
 
 [appearance.menu]
-opacity = 0.95
-backdrop_blur = true
+backdrop = 0.3
 ```
 
 See the [Configuration Reference](../reference/config-reference.md) for a complete list of all configuration options.

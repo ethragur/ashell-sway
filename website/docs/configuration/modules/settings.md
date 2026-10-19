@@ -14,6 +14,8 @@ It displays in the status bar indicators about:
 - Network status
 - Bluetooth connection status
 - Battery status
+- Peripheral battery status
+- Screen brightness
 - Power profile
 - Idle inhibitor status
 - VPN connection status
@@ -26,13 +28,25 @@ And lets you interact with these settings:
 - Toggle VPN connection
 - Toggle airplane mode
 - Change brightness
+- Change the keyboard backlight
 - Toggle bluetooth
 - Change power profile
 - Toggle idle inhibitor
 - Lock the screen
 - Suspend, hibernate, logout, reboot, or shutdown the system
 
-You can configure some function of this module.
+## Battery Details
+
+Clicking the battery in the settings menu opens a submenu with the battery's
+health (its current full capacity compared to the design capacity) and charge
+cycles, followed by the batteries of connected peripherals. The battery tooltip
+in the bar shows the same health and cycle count.
+
+Health and cycles are shown only when UPower reports them: cycles need a single
+system battery and a driver that counts them. To hide them, see
+[Battery Health](#battery-health).
+
+You can configure this module.
 
 With the `lock_cmd` option you can set a command to lock  
 the system, if not set the related button will not appear.
@@ -58,6 +72,20 @@ options you can set commands to open the audio settings
 for sinks and sources, if not set the related buttons will not appear.  
 When configured, right-clicking the speaker or microphone indicators (or their quick settings buttons) launches the respective command immediately.
 
+With the `audio_sink_post_switch_cmd` and `audio_source_post_switch_cmd` options
+you can set commands that are automatically executed after switching the audio output or input device.
+This is useful for working around PipeWire or WirePlumber issues where audio doesn't
+properly route to the new device without a service restart.
+
+The command is executed asynchronously (fire-and-forget) via `bash -c` once the device
+selected in the menu has become the new default. If the audio server picks a different
+device instead (for example an output with nothing connected), the command is not run.
+
+```toml
+[settings]
+audio_sink_post_switch_cmd = "systemctl --user restart wireplumber"
+```
+
 With the `wifi_more_cmd`, `vpn_more_cmd` and `bluetooth_more_cmd` options  
 you can set commands to open the network, VPN and bluetooth settings.  
 Right-clicking the Wi-Fi, VPN, Bluetooth or airplane-mode quick settings buttons (and the Wi-Fi indicator in the bar) triggers these commands directly when they are set.
@@ -68,10 +96,52 @@ With the `remove_airplane_btn` option you can remove the airplane mode button.
 
 With the `remove_idle_btn` option you can remove the idle inhibitor button.
 
+With the `remove_dnd_btn` option you can remove the do not disturb button.
+The button is only shown when the [Notifications](notifications.md) module is
+part of the bar layout, since do not disturb only applies while ashell is the
+notification daemon.
+
+## Share Wi-Fi
+
+When connected to a Wi-Fi network via NetworkManager, a small QR-code button appears
+next to the active network row in the Wi-Fi sub-menu. Clicking it opens a popup
+showing the SSID, a QR code encoding a standard `WIFI:T:<auth>;S:<ssid>;P:<password>;;`
+payload, and the plaintext password. Scanning the QR code with another device lets it
+join the network without typing the password.
+
+The authentication type follows the connection profile's `key-mgmt`: `WPA` for
+WPA/WPA2 personal and `SAE` for WPA3 personal. Networks marked as hidden also get an
+`H:true;` field, without which a scanner would not find them.
+
+This feature is only available when using the NetworkManager backend. The button is
+hidden when ashell falls back to another backend.
+
+The QR code follows the ZXing WIFI URI format. Note that SSID and password are
+escaped using the ZXing reserved characters (`\ ; , : "`); non-ASCII characters are
+not hex-encoded, so QR scanners may not correctly parse networks whose SSID or
+password contains non-ASCII characters.
+
+Notes and limitations:
+
+- The password is fetched via
+  `org.freedesktop.NetworkManager.Settings.Connection.GetSecrets`, gated by the
+  `org.freedesktop.NetworkManager.settings.modify.system` polkit action. Users in an
+  active local session are implicitly authorized; otherwise polkit may prompt for
+  authentication or deny the request.
+- For open (password-less) networks the QR encodes `WIFI:T:nopass;S:<ssid>;;` and a
+  "no password required" notice is shown.
+- If the passphrase cannot be read — the secret is owned by an agent, stored with
+  `psk-flags` set to not-saved, or polkit denies the request — the dialog says so
+  instead of showing a QR code. A secured network is never presented as open.
+- Authentication methods that a `WIFI:` URI cannot carry (802.1X enterprise, OWE, and
+  static WEP) are reported as unsupported rather than encoded.
+
 ## Tooltips
 
 By default, hovering over the status bar indicators shows a tooltip describing
 each one. With the `enable_tooltips` option you can disable these hover tooltips.
+It only affects the settings indicators: [custom modules](./custom_module.md#tooltip)
+show a tooltip whenever their `listen_cmd` sends one.
 
 The default value is `true`.
 
@@ -84,11 +154,30 @@ enable_tooltips = false
 
 With the format options you can customize how different indicators are displayed in the status bar.
 
-All format options support the same values:
+Every format option accepts the same set of values, but not every indicator has
+something meaningful to show for each of them. The values are:
 
-- `Icon` - Show only the icon
-- `Percentage` (or `Value`) - Show only the numeric value (percentage, count, or strength)
-- `IconAndPercentage` (or `IconAndValue`) - Show both the icon and the numeric value (default)
+| Value | Shows |
+| --- | --- |
+| `Icon` | Only the icon |
+| `Percentage` (alias `Value`) | Only the value (percentage, count, or strength) |
+| `IconAndPercentage` (alias `IconAndValue`) | The icon followed by the value |
+| `Time` | Only the remaining time (battery indicators) |
+| `IconAndTime` | The icon followed by the remaining time |
+| `Name` | Only the name |
+| `IconAndName` | The icon followed by the name |
+| `PercentageAndTime` | The value followed by the remaining time (battery indicators) |
+| `IconAndPercentageAndTime` | The icon, the value and the remaining time |
+
+:::info
+`Name` and `IconAndName` show a name for the **network** (SSID) and
+**peripheral** (device name) indicators; every other indicator keeps showing
+its value: `Name` behaves like `Percentage` and `IconAndName` like
+`IconAndPercentage`.
+
+The defaults are not uniform either: `battery_format` defaults to
+`IconAndPercentage`, every other format option defaults to `Icon`.
+:::
 
 ### Battery Format
 
@@ -99,8 +188,12 @@ The possible values are:
 - `Icon` - Show only the battery icon
 - `Percentage` - Show only the battery percentage
 - `IconAndPercentage` - Show both the battery icon and percentage (default)
-- `Time` - Show smart time display (time to full when charging, time to empty when discharging, "100%" when full)
+- `Time` - Show smart time display (time to full when charging, time to empty when discharging, the percentage when full)
 - `IconAndTime` - Show battery icon with smart time display
+- `PercentageAndTime` - Show the battery percentage along with smart time display
+- `IconAndPercentageAndTime` - Show battery icon with battery percentage and smart time display
+- `Name` - Accepted, but a battery has no name: renders like `Percentage`
+- `IconAndName` - Accepted, but renders like `IconAndPercentage`
 
 ```toml
 [settings]
@@ -124,8 +217,12 @@ The `Time` and `IconAndTime` formats provide intelligent time display:
 
 - **When charging**: Shows time until full (e.g., "45m", "2h 15m")
 - **When discharging**: Shows time until empty (e.g., "1h 30m", "3h 45m")
-- **When at 100%**: Shows "100%"
-- **When calculating**: Shows "Calculating..." for system battery, empty for peripherals
+- **When charging or discharging with no estimate yet**: Shows "Calculating..." (translated),
+  for both the system battery and peripherals
+- **Otherwise** (full or at 100%, not charging, unknown): Shows the plain percentage
+
+`PercentageAndTime` and `IconAndPercentageAndTime` append the same time to the
+percentage, and show only the percentage when there is no time to add.
 
 ```toml
 [settings]
@@ -143,9 +240,10 @@ peripheral_battery_format = "IconAndTime"
 
 ### Peripheral Battery Format
 
-In the same way it's possible to customize the peripheral battery indicator format.
-The possible values are the same as above, but you need to use
-the `peripheral_battery_format` option.
+In the same way it's possible to customize the peripheral battery indicator
+format with the `peripheral_battery_format` option. It accepts the same values;
+`Name` and `IconAndName` show the device name.
+
 The default value is `Icon`.
 
 With the `peripheral_indicators` you can decide which peripheral battery indicators
@@ -174,7 +272,7 @@ bluetooth_indicator_format = "Icon"
 
 ### Peripheral Expanded By Default
 
-When set to `true`, the peripheral battery submenu will be open by default when opening the settings menu.
+When set to `true`, the battery submenu (battery details and peripheral batteries) will be open by default when opening the settings menu.
 
 The default value is `false`.
 
@@ -183,9 +281,24 @@ The default value is `false`.
 peripheral_expanded_by_default = true
 ```
 
+### Battery Health
+
+With the `battery_health` option you can hide the battery's health and charge
+cycles, from both the battery tooltip and the battery submenu. The battery in
+the settings menu then opens the submenu only when peripheral batteries are
+connected.
+
+The default value is `true`.
+
+```toml
+[settings]
+battery_health = false
+```
+
 ### Audio Format
 
 With the `audio_indicator_format` option you can customize the audio volume indicator format.
+The value it shows is the current output volume as a percentage.
 
 The default value is `Icon`.
 
@@ -231,18 +344,26 @@ microphone_indicator_format = "IconAndPercentage"
 
 With the `network_indicator_format` option you can customize the network connection indicator format.
 For WiFi connections, this shows the signal strength as a percentage.
+You can also use `Name` or `IconAndName` to display the connected network name (the SSID for WiFi
+connections, the interface name for wired connections, or the VPN name for VPN connections).
 
 The default value is `Icon`.
 
 ```toml
 [settings]
 network_indicator_format = "IconAndPercentage"
+# or, to show the SSID next to the wifi icon:
+# network_indicator_format = "IconAndName"
 ```
 
 ### Bluetooth Format
 
 With the `bluetooth_indicator_format` option you can customize the bluetooth indicator format.
-When devices are connected, this shows the number of connected devices.
+The value it shows is the number of connected devices.
+
+The indicator is only rendered while Bluetooth is on. When no device is
+connected there is no count to show, so the bar falls back to a plain Bluetooth
+icon whatever format you set.
 
 The default value is `Icon`.
 
@@ -262,32 +383,26 @@ The default value is `Icon`.
 brightness_indicator_format = "IconAndPercentage"
 ```
 
-## Peripheral Indicators
+## Keyboard Backlight
 
-With the `peripheral_indicators` you can decide which peripheral battery indicators
-are shown in the status bar.
+With the `keyboard_backlight_slider` option you can show a slider for the
+built-in keyboard backlight, right below the brightness slider.
 
-The possible values are:
-
-- `All` - Show all peripheral battery indicators (default)
-- `Specific` - Show only the peripheral battery indicators in the specified categories.
-  The possible categories are:
-  - `Keyboard`
-  - `Mouse`
-  - `Headphones`
-  - `Gamepad`
+The default value is `false`.
 
 ```toml
 [settings]
-battery_format = "IconAndPercentage"
-peripheral_battery_format = "Icon"
-peripheral_indicators = { Specific = ["Gamepad", "Keyboard"] }
-audio_indicator_format = "Icon"
-network_indicator_format = "Icon"
-bluetooth_indicator_format = "Icon"
-brightness_indicator_format = "Icon"
+keyboard_backlight_slider = true
 ```
 
+The slider is only rendered when the option is enabled **and** UPower reports a
+built-in keyboard backlight, so enabling it on a machine without one changes
+nothing. USB and Bluetooth keyboards are not covered: they handle their own
+backlight through firmware shortcuts.
+
+Clicking the icon on the left of the slider toggles the backlight off and back
+on, restoring the level it had before it was switched off. Scrolling over the
+slider changes the level in 5% steps.
 ## Status Bar Indicators
 
 With the `indicators` option you can customize which status indicators
@@ -311,8 +426,8 @@ Available indicators are:
 # Customize which indicators to show and their order
 indicators = ["Battery", "Bluetooth", "Network", "Audio", "Microphone"]
 
-# Default indicators (shown in this order):
-indicators = ["IdleInhibitor", "PowerProfile", "Audio", "Microphone", "Bluetooth", "Network", "Vpn", "Battery", "Brightness"]
+# The default, for reference (shown in this order):
+indicators = ["IdleInhibitor", "PowerProfile", "Audio", "Microphone", "Bluetooth", "Network", "Vpn", "Battery"]
 ```
 
 ## Custom Buttons
@@ -362,7 +477,7 @@ Commands are executed with your user privileges. Be careful with commands from u
 
 Each `status_command` has a **1 second timeout**. If the command doesn't complete within this time:
 
-- The button state will be shown as "unknown" (grayed out)
+- The button will be shown as inactive
 - The process will be killed automatically
 - An error will be logged for debugging
 
@@ -400,6 +515,7 @@ We also disable the airplane mode button and the idle inhibitor button.
 lock_cmd = "hyprlock &"
 audio_sinks_more_cmd = "pavucontrol -t 3"
 audio_sources_more_cmd = "pavucontrol -t 4"
+# audio_sink_post_switch_cmd = "systemctl --user restart wireplumber"
 wifi_more_cmd = "nm-connection-editor"
 vpn_more_cmd = "nm-connection-editor"
 bluetooth_more_cmd = "blueman-manager"

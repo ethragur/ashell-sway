@@ -6,16 +6,20 @@ Complete reference for all configuration options in `~/.config/ashell/config.tom
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `log_level` | String | `"warn"` | Log level ([env_logger syntax](https://docs.rs/env_logger)) |
 | `language` | Option\<String\> | auto | UI language (BCP-47 or POSIX, e.g. `"en-US"`). Auto-detected from `$LC_MESSAGES` / `$LANG` when unset |
 | `region` | Option\<String\> | auto | Regional formatting — dates and unit defaults (e.g. `"it-IT"`). Auto-detected from `$LC_TIME` / `$LANG` when unset |
-| `position` | `"Top"` \| `"Bottom"` | `"Bottom"` | Bar position on screen |
+| `position` | `"Top"` \| `"Bottom"` | `"Top"` | Bar position on screen |
 | `layer` | `"Top"` \| `"Bottom"` \| `"Overlay"` | `"Bottom"` | Wayland layer (Bottom = below floating windows) |
 | `outputs` | `"All"` \| `"Active"` \| `{ Targets = [...] }` | `"All"` | Which monitors show the bar |
 | `enable_esc_key` | bool | `false` | Whether ESC key closes menus |
-| `osd.enabled` | bool | `false` | Show OSD overlay for IPC volume/brightness/airplane commands |
+| `osd.enabled` | bool | `false` | Show OSD overlay for IPC volume/microphone/brightness/airplane/idle-inhibitor commands |
 | `osd.timeout` | u64 | `1500` | OSD auto-hide delay in milliseconds |
+| `osd.show_volume_percentage` | bool | `false` | Show the percentage in the volume/microphone OSD |
+| `osd.show_brightness_percentage` | bool | `false` | Show the percentage in the brightness OSD |
 | `animations.enabled` | bool | `false` | Master toggle for UI animations (bar widths, menu open/close, toast slides, etc.) |
+| `logging.level` | String | `"warn"` | Log level ([env_logger syntax](https://docs.rs/env_logger)) |
+| `logging.target` | `"file"` \| `"stdout"` \| `"stderr"` | `"file"` | Where logs are written |
+| `logging.directory` | Option\<PathBuf\> | `$XDG_RUNTIME_DIR` (fallback `$TMPDIR/ashell-<uid>`) | Log directory, only used when `logging.target = "file"`. Supports `~` and `$VAR` |
 
 ## Module Layout
 
@@ -26,16 +30,35 @@ center = ["Tempo"]
 right = [["SystemInfo", "Settings"], "Tray"]
 ```
 
-Module names: `"Workspaces"`, `"WindowTitle"`, `"SystemInfo"`, `"KeyboardLayout"`, `"KeyboardSubmap"`, `"Tray"`, `"Clock"`, `"Tempo"`, `"Privacy"`, `"Settings"`, `"MediaPlayer"`, `"Updates"`, `"Custom:name"`.
+Module names: `"Workspaces"`, `"WindowTitle"`, `"SystemInfo"`, `"KeyboardLayout"`, `"KeyboardSubmap"`, `"Tray"`, `"Notifications"`, `"Tempo"`, `"Privacy"`, `"Settings"`, `"MediaPlayer"`, `"Updates"`. Any other string is the `name` of a custom module.
 
 ## Appearance
 
 ```toml
 [appearance]
-style = "Islands"               # "Islands", "Solid", or "Gradient"
-opacity = 0.9                   # 0.0-1.0
 font_name = "JetBrains Mono"   # Optional custom font
+font_weight = "normal"          # Face of font_name to use (thin ... black)
 scale_factor = 1.0              # DPI scale factor
+opacity = 1.0                   # 0.0-1.0, every surface ashell draws
+blur = "auto"                   # auto|always|never, compositor blur
+
+# `opacity` may instead be a table, replacing the scalar above. Any key may be
+# omitted and falls back to `default`. Keep it after every `[appearance]`
+# scalar, or those scalars become keys of this table.
+# [appearance.opacity]
+# default = 0.8
+# bar = 1.0
+# menu = 0.9
+# osd = 0.6
+# notifications = 0.9
+
+[appearance.bar]
+surface = "transparent"         # "transparent" or "solid"
+radius = "none"                 # none|sm|md|lg|xl, CSS border-radius shorthand (solid only)
+margin = "none"                 # none|xxs..xxl|number(pixels), CSS margin shorthand
+                                # always screen pixels, not scaled by scale_factor
+padding = "xxs"                 # (default) same values, inset inside the bar
+                                # drawn inside the bar, so it does scale
 ```
 
 ### Colors
@@ -43,24 +66,25 @@ scale_factor = 1.0              # DPI scale factor
 ```toml
 # Simple hex color
 [appearance]
-background = "#1e1e2e"
+text_color = "#cdd6f4"
 
 # Complete color with variants
-[appearance.primary]
+[appearance.primary_color]
 base = "#cba6f7"
 strong = "#dbbcff"
 weak = "#a385d8"
 text = "#1e1e2e"
 ```
 
-Available color fields: `background`, `text`, `primary`, `secondary`, `success`, `danger`.
+Available color fields: `background_color`, `primary_color`, `success_color`, `warning_color`, `danger_color`, `text_color`.
+
+`background_color` in its complete form takes `base`, `weakest`, `weaker`, `weak`, `neutral`, `strong`, `stronger`, `strongest` and `text` instead of the `strong`/`weak`/`text` variants above.
 
 ### Menu Appearance
 
 ```toml
 [appearance.menu]
-opacity = 0.95
-backdrop_blur = true
+backdrop = 0.3                  # darkening drawn behind an open menu
 ```
 
 ### Workspace Colors
@@ -87,12 +111,14 @@ If the `[updates]` section is omitted entirely, the Updates module is disabled.
 ```toml
 [workspaces]
 visibility_mode = "All"              # "All", "MonitorSpecific", "MonitorSpecificExclusive"
+indicator_format = "Name"            # "Name" or "NameAndIcons"
 group_by_monitor = false
 enable_workspace_filling = false     # Fill empty workspace slots
 disable_special_workspaces = false
 max_workspaces = 10                  # Optional: limit workspace count
 workspace_names = ["1", "2", "3"]    # Optional: custom names
 enable_virtual_desktops = false
+invert_scroll_direction = "All"      # Optional: "All", "Mouse" or "Trackpad"; omit to keep the normal direction
 ```
 
 ## Window Title Module
@@ -114,62 +140,131 @@ labels = { "English (US)" = "EN", "Italian" = "IT" }
 
 ```toml
 [system_info]
+# "Cpu", "Memory", "MemorySwap", "Temperature", "IpAddress",
+# "DownloadSpeed", "UploadSpeed", or { Disk = "/path", Name = "label" }
+indicators = ["Cpu", "Memory", "Temperature"]
+interval = 5                         # Refresh interval in seconds
+
 # CPU thresholds
 [system_info.cpu]
 warn_threshold = 60
 alert_threshold = 80
+format = "Percentage"                # "Percentage" or "Frequency"
 
 # Memory thresholds
 [system_info.memory]
-warn_threshold = 60
-alert_threshold = 80
+warn_threshold = 70
+alert_threshold = 85
+format = "Percentage"                # "Percentage", "Amount" or "Fraction"
 
-# Temperature thresholds
+# Temperature thresholds (default 60/80 °C, converted when units is Fahrenheit)
 [system_info.temperature]
 warn_threshold = 60
 alert_threshold = 80
+sensor = "Cpu"
+# units = "Celsius"
 
 # Disk thresholds
 [system_info.disk]
-warn_threshold = 60
-alert_threshold = 80
+warn_threshold = 80
+alert_threshold = 90
+format = "Percentage"                # "Percentage" or "Fraction"
+# mounts = ["/", "/home"]
 ```
 
 **Dependencies:**
-- Temperature monitoring reads the kernel `hwmon` sysfs interface directly (no extra package required). The `sensor` option is either a type keyword (`"Cpu"`, `"Gpu"`, `"Acpi"`, `"Nvme"`) for auto-detection or an exact hwmon label (e.g. `"acpitz temp1"`) — run `sensors` (from `lm_sensors`) to find the right name. The displayed unit follows the locale / unit system, not a per-module option.
+- Temperature monitoring reads the kernel `hwmon` sysfs interface directly (no extra package required). The `sensor` option is either a type keyword (`"Cpu"`, `"Gpu"`, `"Acpi"`, `"Nvme"`) for auto-detection or an exact hwmon label (e.g. `"acpitz temp1"`) — run `sensors` (from `lm_sensors`) to find the right name. The displayed unit follows the locale / unit system unless `units` (`"Celsius"` / `"Fahrenheit"`) overrides it.
 - CPU, memory, disk, and network info use standard kernel interfaces and do not need extra packages.
-
-## Clock Module (Deprecated)
-
-```toml
-[clock]
-format = "%H:%M"    # chrono format string
-```
 
 ## Tempo Module
 
 ```toml
 [tempo]
-format = "%H:%M"
-date_format = "%A, %B %d"
+clock_format = "%a %d %b %R"           # chrono format string
+formats = ["%R", "%a %d %b %R"]        # Optional: formats to cycle through, overrides clock_format
 timezones = ["America/New_York", "Europe/London"]
-weather_location = "Rome"              # Or coordinates
-weather_format = "{temp}°C"
+weather_location = { City = "Rome" }   # "Current", { City = "..." } or { Coordinates = [lat, lon] }; omit to disable weather
+weather_indicator = "IconAndTemperature"  # "IconAndTemperature", "Icon" or "None"
+wind_speed_unit = "Kmh"                # Optional: "Kmh", "Mph" or "Ms"; defaults from the unit system
+```
+
+## Notifications Module
+
+```toml
+[notifications]
+format = "%H:%M"                       # Timestamp format (chrono)
+show_timestamps = true
+show_bodies = true
+grouped = false
+toast = true                           # Show popup toasts
+toast_position = "TopRight"            # "TopLeft", "TopRight", "TopCenter", "BottomLeft", "BottomRight", "BottomCenter"
+toast_timeout = 5000                   # Milliseconds
+toast_limit = 5
+toast_max_height = 150
+history_limit = 200                    # Notifications kept in the menu, 1..=1000
+blocklist = ["^Spotify$"]              # Regexes matched against the app name
+```
+
+## Tray Module
+
+```toml
+[tray]
+blocklist = ["^nm-applet$"]            # Regexes matched against the tray item name
+right_click = "Menu"                   # Optional: "Open" or "Menu"
 ```
 
 ## Settings Module
 
 ```toml
 [settings]
+lock_cmd = "hyprlock"                  # Optional
+shutdown_cmd = "shutdown now"
+suspend_cmd = "systemctl suspend"
+hibernate_cmd = "systemctl hibernate"  # Optional
+reboot_cmd = "systemctl reboot"
+logout_cmd = "loginctl kill-user $(whoami)"
+
+# "IdleInhibitor", "PowerProfile", "Audio", "Microphone", "Network", "Vpn",
+# "Bluetooth", "Battery", "PeripheralBattery", "Brightness"
+indicators = ["IdleInhibitor", "PowerProfile", "Audio", "Microphone", "Bluetooth", "Network", "Vpn", "Battery"]
+
+# Indicator formats: "Icon", "Percentage", "IconAndPercentage", "Time", "IconAndTime",
+# "Name", "IconAndName", "PercentageAndTime", "IconAndPercentageAndTime"
+battery_format = "IconAndPercentage"
+battery_hide_when_full = false
+peripheral_indicators = "All"          # or { Specific = [...] }
+peripheral_battery_format = "Icon"
+peripheral_expanded_by_default = false
+battery_health = true                  # battery health and charge cycles
+audio_indicator_format = "Icon"
+microphone_indicator_format = "Icon"
+network_indicator_format = "Icon"
+bluetooth_indicator_format = "Icon"
+brightness_indicator_format = "Icon"
+
+volume_step = 5                        # 1-50
+max_volume = 100                       # 1-200
+
+# Optional commands for the "more" buttons and after switching audio device
+# audio_sinks_more_cmd, audio_sources_more_cmd, audio_sink_post_switch_cmd,
+# audio_source_post_switch_cmd, wifi_more_cmd, vpn_more_cmd, bluetooth_more_cmd
+
+remove_airplane_btn = false
+remove_idle_btn = false
+
 # Enable/disable hover tooltips on status indicators (audio, bluetooth, wifi, battery)
 enable_tooltips = true
 
+# Show a slider for the built-in keyboard backlight, under the brightness slider
+keyboard_backlight_slider = false
+
 # Custom buttons in the settings panel
-[[settings.custom_buttons]]
+[[settings.CustomButton]]
+name = "VPN"
 icon = "\u{f023}"
-label = "VPN"
-status_cmd = "vpn-status"
-on_click = "vpn-toggle"
+command = "vpn-toggle"
+status_command = "vpn-status"          # Optional
+tooltip = "Toggle VPN"                 # Optional
 ```
 
 **Sub-module dependencies:** The Settings module requires `systemd-logind` for shutdown/reboot/sleep actions.
@@ -181,15 +276,27 @@ on_click = "vpn-toggle"
 | Brightness | systemd-logind (usually present) |
 | Network | `networkmanager` or `iwd` |
 | Power (battery) | `upower` |
+| Keyboard backlight | `upower` (built-in keyboard only) |
 
 ## Media Player Module
 
 ```toml
 [media_player]
-format = "{artist} - {title}"
+indicator_format = "IconAndText"     # "Text", "IconAndText", or "Icon"
+indicator_fields = ["Artist", "Title"]
+max_text_length = 100
+indicator_visualizer = "Background"  # "Background", "Before", or "After"; omit to disable
+menu_visualizer = false              # bars behind the menu cards; cava runs only while the menu is open
+visualizer_framerate = 30            # cava frames per second, clamped to 1-144
+
+[media_player.indicator_controls]
+left = "Menu"                        # "Menu", "Prev", "PlayPause", "Next", or "None"
+middle = "None"
+right = "None"
+scroll = "None"                      # "Volume" or "None"
 ```
 
-**Dependencies:** Any MPRIS-compatible media player (e.g., Spotify, Firefox, VLC, Strawberry). No extra system package is needed.
+**Dependencies:** Any MPRIS-compatible media player (e.g., Spotify, Firefox, VLC, Strawberry). No extra system package is needed. The visualizer additionally needs `cava` on `$PATH`.
 
 ## Custom Modules
 
@@ -224,14 +331,19 @@ Custom module fields:
 | `icons` | Map | No | Regex → icon mapping for dynamic icons |
 | `alert` | String (regex) | No | Regex to show alert indicator |
 
-The `listen_cmd` output must be JSON lines with `text` and `alt` fields:
+The `listen_cmd` output must be JSON lines with `text` and `alt` fields, and
+an optional `tooltip` (plain text, `\n` for new lines) shown on hover:
 ```json
-{"text": "50%", "alt": "volume"}
+{"text": "50%", "alt": "volume", "tooltip": "Speakers: 50%"}
 ```
 
-Reference a custom module in the layout as `"Custom:name"`:
+Reference a custom module in the layout by its `name`:
 
 ```toml
 [modules]
-right = ["Custom:volume", "Settings"]
+right = ["volume", "Settings"]
 ```
+
+A name that matches no built-in module and no `[[CustomModule]]` is skipped
+without any error, so a typo (or a `"Custom:"` prefix) makes the module silently
+disappear.

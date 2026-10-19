@@ -1,7 +1,7 @@
 use crate::app::Message;
-use crate::i18n::{UnitSystem, unit_system};
+use crate::i18n::{TemperatureUnit, UnitSystem, unit_system};
 use crate::services::upower::PeripheralDeviceKind;
-use crate::utils::celsius_to_fahrenheit;
+use crate::theme::Space;
 use hex_color::HexColor;
 use iced::futures::StreamExt;
 use iced::{Color, Subscription, futures::SinkExt, stream::channel, theme::palette};
@@ -10,7 +10,10 @@ use inotify::Inotify;
 use inotify::WatchMask;
 use log::{debug, error, info, warn};
 use regex::Regex;
-use serde::{Deserialize, Deserializer, de::Visitor};
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, MapAccess, Visitor},
+};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 use std::path::PathBuf;
@@ -20,10 +23,53 @@ use tokio::time::sleep;
 
 pub const DEFAULT_CONFIG_FILE_PATH: &str = "~/.config/ashell/config.toml";
 
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogTarget {
+    #[default]
+    File,
+    Stdout,
+    Stderr,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default)]
+pub struct LoggingConfig {
+    pub level: String,
+    pub target: LogTarget,
+    pub directory: Option<PathBuf>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "warn".to_owned(),
+            target: LogTarget::default(),
+            directory: None,
+        }
+    }
+}
+
+impl LoggingConfig {
+    pub fn log_directory(&self) -> anyhow::Result<PathBuf> {
+        let default_directory = || crate::xdg::private_dir(true);
+
+        match &self.directory {
+            Some(directory) => expand_path(directory.clone()).or_else(|e| {
+                eprintln!(
+                    "ashell: warning: cannot expand logging.directory {directory:?}: {e}, using the default"
+                );
+                default_directory()
+            }),
+            None => default_directory(),
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct Config {
-    pub log_level: String,
+    pub logging: LoggingConfig,
     pub language: Option<String>,
     pub region: Option<String>,
     pub position: Position,
@@ -48,35 +94,6 @@ pub struct Config {
     pub osd: OsdConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            log_level: "warn".to_owned(),
-            language: None,
-            region: None,
-            position: Position::default(),
-            layer: Layer::default(),
-            outputs: Outputs::default(),
-            modules: Modules::default(),
-            updates: None,
-            workspaces: WorkspacesModuleConfig::default(),
-            window_title: WindowTitleConfig::default(),
-            system_info: SystemInfoModuleConfig::default(),
-            notifications: NotificationsModuleConfig::default(),
-            tray: TrayModuleConfig::default(),
-            tempo: TempoModuleConfig::default(),
-            settings: SettingsModuleConfig::default(),
-            appearance: Appearance::default(),
-            media_player: MediaPlayerModuleConfig::default(),
-            keyboard_layout: KeyboardLayoutModuleConfig::default(),
-            animations: AnimationsConfig::default(),
-            custom_modules: vec![],
-            enable_esc_key: false,
-            osd: OsdConfig::default(),
-        }
-    }
-}
-
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct AnimationsConfig {
@@ -88,8 +105,18 @@ impl Config {
         if let Some(ref mut updates) = self.updates {
             updates.validate();
         }
+        self.appearance.bar.margin.validate("appearance.bar.margin");
+        self.appearance
+            .bar
+            .padding
+            .validate("appearance.bar.padding");
+        self.appearance.bar.border.validate("appearance.bar.border");
+        self.appearance.modules.validate(&self.custom_modules);
         self.system_info.validate();
+        self.tempo.validate();
         self.settings.validate();
+        self.media_player.validate();
+        self.notifications.validate();
     }
 }
 
@@ -122,10 +149,18 @@ pub enum WorkspaceVisibilityMode {
     MonitorSpecificExclusive,
 }
 
+#[derive(Deserialize, Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub enum WorkspaceIndicatorFormat {
+    #[default]
+    Name,
+    NameAndIcons,
+}
+
 #[derive(Deserialize, Clone, Default, Debug)]
 #[serde(default)]
 pub struct WorkspacesModuleConfig {
     pub visibility_mode: WorkspaceVisibilityMode,
+    pub indicator_format: WorkspaceIndicatorFormat,
     pub group_by_monitor: bool,
     pub enable_workspace_filling: bool,
     pub disable_special_workspaces: bool,
@@ -243,7 +278,7 @@ impl Default for SystemInfoMemory {
 const DEFAULT_TEMP_WARN_CELSIUS: i32 = 60;
 const DEFAULT_TEMP_ALERT_CELSIUS: i32 = 80;
 
-#[derive(Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Deserialize, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TemperatureSensorType {
     #[default]
     Cpu,
@@ -253,7 +288,7 @@ pub enum TemperatureSensorType {
 }
 
 /// A type keyword (auto-detected) or an exact sensor label.
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[serde(untagged)]
 pub enum TemperatureSensor {
     Type(TemperatureSensorType),
@@ -272,23 +307,27 @@ pub struct SystemInfoTemperature {
     warn_threshold: Option<i32>,
     alert_threshold: Option<i32>,
     pub sensor: TemperatureSensor,
+    units: Option<TemperatureUnit>,
 }
 
 impl SystemInfoTemperature {
+    pub fn resolved_units(&self) -> TemperatureUnit {
+        self.units
+            .unwrap_or_else(|| unit_system().temperature_unit())
+    }
+
     pub fn warn_threshold(&self) -> i32 {
-        self.warn_threshold
-            .unwrap_or_else(|| match crate::i18n::unit_system() {
-                UnitSystem::Metric => DEFAULT_TEMP_WARN_CELSIUS,
-                UnitSystem::Imperial => celsius_to_fahrenheit(DEFAULT_TEMP_WARN_CELSIUS),
-            })
+        self.warn_threshold.unwrap_or_else(|| {
+            self.resolved_units()
+                .convert_celsius(DEFAULT_TEMP_WARN_CELSIUS)
+        })
     }
 
     pub fn alert_threshold(&self) -> i32 {
-        self.alert_threshold
-            .unwrap_or_else(|| match crate::i18n::unit_system() {
-                UnitSystem::Metric => DEFAULT_TEMP_ALERT_CELSIUS,
-                UnitSystem::Imperial => celsius_to_fahrenheit(DEFAULT_TEMP_ALERT_CELSIUS),
-            })
+        self.alert_threshold.unwrap_or_else(|| {
+            self.resolved_units()
+                .convert_celsius(DEFAULT_TEMP_ALERT_CELSIUS)
+        })
     }
 
     fn validate(&mut self) {
@@ -309,6 +348,7 @@ pub enum DiskFormat {
 pub enum MemoryFormat {
     #[default]
     Percentage,
+    Amount,
     Fraction,
 }
 
@@ -417,8 +457,10 @@ pub enum ToastPosition {
     TopLeft,
     #[default]
     TopRight,
+    TopCenter,
     BottomLeft,
     BottomRight,
+    BottomCenter,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -433,6 +475,7 @@ pub struct NotificationsModuleConfig {
     pub toast_timeout: u64,
     pub toast_limit: usize,
     pub toast_max_height: u32,
+    pub history_limit: usize,
     pub blocklist: Vec<RegexCfg>,
 }
 impl Default for NotificationsModuleConfig {
@@ -447,7 +490,21 @@ impl Default for NotificationsModuleConfig {
             toast_timeout: 5000,
             toast_limit: 5,
             toast_max_height: 150,
+            history_limit: 200,
             blocklist: vec![],
+        }
+    }
+}
+
+impl NotificationsModuleConfig {
+    fn validate(&mut self) {
+        let clamped = self.history_limit.clamp(1, 1000);
+        if self.history_limit != clamped {
+            warn!(
+                "notifications.history_limit ({}) out of range 1..=1000, clamping to {clamped}",
+                self.history_limit
+            );
+            self.history_limit = clamped;
         }
     }
 }
@@ -488,6 +545,20 @@ impl TempoModuleConfig {
                 UnitSystem::Imperial => WindSpeedUnit::Mph,
                 UnitSystem::Metric => WindSpeedUnit::Kmh,
             },
+        }
+    }
+
+    fn validate(&mut self) {
+        if let Some(WeatherLocation::Coordinates(lat, lon)) = &mut self.weather_location {
+            let clamped_lat = lat.clamp(-90.0, 90.0);
+            let clamped_lon = lon.clamp(-180.0, 180.0);
+            if *lat != clamped_lat || *lon != clamped_lon {
+                warn!(
+                    "tempo.weather_location latitude ({lat}) must be in -90..=90 and longitude ({lon}) in -180..=180, setting to ({clamped_lat}, {clamped_lon})"
+                );
+                *lat = clamped_lat;
+                *lon = clamped_lon;
+            }
         }
     }
 }
@@ -585,6 +656,10 @@ pub enum SettingsFormat {
     IconAndPercentage,
     Time,
     IconAndTime,
+    Name,
+    IconAndName,
+    PercentageAndTime,
+    IconAndPercentageAndTime,
 }
 
 #[derive(Deserialize, Clone, Default, PartialEq, Eq, Debug)]
@@ -610,6 +685,7 @@ pub struct SettingsModuleConfig {
     pub peripheral_indicators: PeripheralIndicators,
     pub peripheral_battery_format: SettingsFormat,
     pub peripheral_expanded_by_default: bool,
+    pub battery_health: bool,
     pub volume_step: u8,
     pub max_volume: u8,
     pub audio_indicator_format: SettingsFormat,
@@ -622,6 +698,10 @@ pub struct SettingsModuleConfig {
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub audio_sources_more_cmd: Option<String>,
     #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub audio_sink_post_switch_cmd: Option<String>,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub audio_source_post_switch_cmd: Option<String>,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     pub wifi_more_cmd: Option<String>,
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub vpn_more_cmd: Option<String>,
@@ -629,10 +709,12 @@ pub struct SettingsModuleConfig {
     pub bluetooth_more_cmd: Option<String>,
     pub remove_airplane_btn: bool,
     pub remove_idle_btn: bool,
+    pub remove_dnd_btn: bool,
     pub enable_tooltips: bool,
     pub indicators: Vec<SettingsIndicator>,
     #[serde(rename = "CustomButton")]
     pub custom_buttons: Vec<SettingsCustomButton>,
+    pub keyboard_backlight_slider: bool,
 }
 
 impl Default for SettingsModuleConfig {
@@ -649,6 +731,7 @@ impl Default for SettingsModuleConfig {
             peripheral_indicators: Default::default(),
             peripheral_battery_format: SettingsFormat::Icon,
             peripheral_expanded_by_default: false,
+            battery_health: true,
             volume_step: 5,
             max_volume: 100,
             audio_indicator_format: SettingsFormat::Icon,
@@ -658,11 +741,14 @@ impl Default for SettingsModuleConfig {
             brightness_indicator_format: SettingsFormat::Icon,
             audio_sinks_more_cmd: Default::default(),
             audio_sources_more_cmd: Default::default(),
+            audio_sink_post_switch_cmd: Default::default(),
+            audio_source_post_switch_cmd: Default::default(),
             wifi_more_cmd: Default::default(),
             vpn_more_cmd: Default::default(),
             bluetooth_more_cmd: Default::default(),
             remove_airplane_btn: Default::default(),
             remove_idle_btn: Default::default(),
+            remove_dnd_btn: Default::default(),
             enable_tooltips: true,
             indicators: vec![
                 SettingsIndicator::IdleInhibitor,
@@ -673,9 +759,9 @@ impl Default for SettingsModuleConfig {
                 SettingsIndicator::Network,
                 SettingsIndicator::Vpn,
                 SettingsIndicator::Battery,
-                SettingsIndicator::Brightness,
             ],
             custom_buttons: Default::default(),
+            keyboard_backlight_slider: Default::default(),
         }
     }
 }
@@ -712,22 +798,110 @@ pub struct SettingsCustomButton {
 #[derive(Deserialize, Copy, Clone, Default, PartialEq, Eq, Debug)]
 pub enum MediaPlayerFormat {
     Icon,
+    #[serde(alias = "Title")]
+    Text,
+    #[serde(alias = "IconAndTitle")]
     #[default]
-    IconAndTitle,
+    IconAndText,
+}
+
+#[derive(Deserialize, Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MediaPlayerTextField {
+    Artist,
+    Title,
+    Album,
+}
+
+#[derive(Deserialize, Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MediaPlayerVisualizer {
+    Background,
+    Before,
+    After,
+}
+
+/// What a mouse button on the media player indicator does.
+#[derive(Deserialize, Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub enum MediaPlayerButtonAction {
+    /// Open the media player menu.
+    Menu,
+    Prev,
+    PlayPause,
+    Next,
+    #[default]
+    None,
+}
+
+/// What the scroll wheel on the media player indicator does. Separate from
+/// [`MediaPlayerButtonAction`] because the click actions make no sense on a
+/// wheel, and a wrong value should be rejected at parse time.
+#[derive(Deserialize, Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub enum MediaPlayerScrollAction {
+    /// Change the volume of the active player, in 5% steps.
+    Volume,
+    #[default]
+    None,
+}
+
+#[derive(Deserialize, Copy, Clone, PartialEq, Eq, Debug)]
+#[serde(default)]
+pub struct MediaPlayerIndicatorControls {
+    pub left: MediaPlayerButtonAction,
+    pub middle: MediaPlayerButtonAction,
+    pub right: MediaPlayerButtonAction,
+    pub scroll: MediaPlayerScrollAction,
+}
+
+impl Default for MediaPlayerIndicatorControls {
+    fn default() -> Self {
+        Self {
+            left: MediaPlayerButtonAction::Menu,
+            middle: MediaPlayerButtonAction::None,
+            right: MediaPlayerButtonAction::None,
+            scroll: MediaPlayerScrollAction::None,
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct MediaPlayerModuleConfig {
-    pub max_title_length: u32,
     pub indicator_format: MediaPlayerFormat,
+    pub indicator_fields: Vec<MediaPlayerTextField>,
+    pub max_text_length: u32,
+    pub indicator_visualizer: Option<MediaPlayerVisualizer>,
+    pub menu_visualizer: bool,
+    pub visualizer_framerate: u32,
+    pub indicator_controls: MediaPlayerIndicatorControls,
 }
 
 impl Default for MediaPlayerModuleConfig {
     fn default() -> Self {
         MediaPlayerModuleConfig {
-            max_title_length: 100,
             indicator_format: MediaPlayerFormat::default(),
+            indicator_fields: vec![MediaPlayerTextField::Artist, MediaPlayerTextField::Title],
+            max_text_length: 100,
+            indicator_visualizer: None,
+            menu_visualizer: false,
+            visualizer_framerate: Self::DEFAULT_VISUALIZER_FRAMERATE,
+            indicator_controls: MediaPlayerIndicatorControls::default(),
+        }
+    }
+}
+
+impl MediaPlayerModuleConfig {
+    const DEFAULT_VISUALIZER_FRAMERATE: u32 = 30;
+    const MAX_VISUALIZER_FRAMERATE: u32 = 144;
+
+    fn validate(&mut self) {
+        let clamped = self
+            .visualizer_framerate
+            .clamp(1, Self::MAX_VISUALIZER_FRAMERATE);
+        if clamped != self.visualizer_framerate {
+            warn!(
+                "MediaPlayerModuleConfig.visualizer_framerate is {}, setting to {clamped}",
+                self.visualizer_framerate
+            );
+            self.visualizer_framerate = clamped;
         }
     }
 }
@@ -850,7 +1024,8 @@ impl BackgroundAppearanceColor {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum BackgroundLevel {
     Weakest,
     Weaker,
@@ -862,27 +1037,612 @@ pub enum BackgroundLevel {
 }
 
 #[derive(Deserialize, Default, Copy, Clone, Eq, PartialEq, Debug)]
-pub enum AppearanceStyle {
+#[serde(rename_all = "lowercase")]
+pub enum BarSurface {
     #[default]
-    Islands,
+    Transparent,
     Solid,
-    Gradient,
 }
 
-#[derive(Deserialize, Clone, Copy, Debug)]
+#[derive(Deserialize, Default, Copy, Clone, Eq, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum RadiusSize {
+    #[default]
+    None,
+    Sm,
+    Md,
+    Lg,
+    Xl,
+}
+
+#[derive(Deserialize, Default, Copy, Clone, Eq, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum SpaceSize {
+    #[default]
+    None,
+    Xxs,
+    Xs,
+    Sm,
+    Md,
+    Lg,
+    Xl,
+    Xxl,
+}
+
+#[derive(Deserialize, Copy, Clone, PartialEq, Debug)]
+#[serde(untagged)]
+pub enum MarginSize {
+    SpaceSize(SpaceSize),
+    Pixels(f32),
+}
+
+impl Default for MarginSize {
+    fn default() -> Self {
+        Self::SpaceSize(SpaceSize::default())
+    }
+}
+
+/// Layer-shell accepts negative margins, which silently push the bar off
+/// screen; a negative or non-finite length here is always a mistake.
+fn is_valid_length(length: f32) -> bool {
+    length.is_finite() && length >= 0.0
+}
+
+impl MarginSize {
+    fn validate(&mut self, field: &str, edge: &str) {
+        if let MarginSize::Pixels(pixels) = *self
+            && !is_valid_length(pixels)
+        {
+            warn!("{field} {edge} ({pixels}) is not a valid length, using 0");
+            *self = MarginSize::Pixels(0.0);
+        }
+    }
+}
+
+impl From<MarginSize> for f32 {
+    fn from(value: MarginSize) -> Self {
+        match value {
+            MarginSize::SpaceSize(space_size) => Space::default().resolve(space_size),
+            MarginSize::Pixels(pixels) => pixels,
+        }
+    }
+}
+
+impl From<MarginSize> for i32 {
+    fn from(value: MarginSize) -> Self {
+        match value {
+            MarginSize::SpaceSize(space_size) => Space::default().resolve(space_size) as i32,
+            MarginSize::Pixels(pixels) => pixels as i32,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CssShorthand<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T: Copy> CssShorthand<T> {
+    fn expand<E: serde::de::Error>(self) -> Result<[T; 4], E> {
+        let values = match self {
+            CssShorthand::One(v) => return Ok([v, v, v, v]),
+            CssShorthand::Many(v) => v,
+        };
+        match values.as_slice() {
+            [a] => Ok([*a, *a, *a, *a]),
+            [a, b] => Ok([*a, *b, *a, *b]),
+            [a, b, c, d] => Ok([*a, *b, *c, *d]),
+            _ => Err(E::custom("expected 1, 2 or 4 values (CSS shorthand)")),
+        }
+    }
+}
+
+/// Per-corner radius selection, deserialized with CSS `border-radius` shorthand:
+/// 1 value = all corners, 2 = `[top-left+bottom-right, top-right+bottom-left]`,
+/// 4 = `[top-left, top-right, bottom-right, bottom-left]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct BarRadius {
+    pub top_left: RadiusSize,
+    pub top_right: RadiusSize,
+    pub bottom_right: RadiusSize,
+    pub bottom_left: RadiusSize,
+}
+
+impl<'de> Deserialize<'de> for BarRadius {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let [top_left, top_right, bottom_right, bottom_left] =
+            CssShorthand::<RadiusSize>::deserialize(deserializer)?.expand()?;
+        Ok(Self {
+            top_left,
+            top_right,
+            bottom_right,
+            bottom_left,
+        })
+    }
+}
+
+/// Per-edge margin selection, deserialized with CSS `margin` shorthand:
+/// 1 value = all edges, 2 = `[vertical, horizontal]`, 4 = `[top, right, bottom, left]`.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct BarMargin {
+    pub top: MarginSize,
+    pub right: MarginSize,
+    pub bottom: MarginSize,
+    pub left: MarginSize,
+}
+
+impl<'de> Deserialize<'de> for BarMargin {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let [top, right, bottom, left] =
+            CssShorthand::<MarginSize>::deserialize(deserializer)?.expand()?;
+        Ok(Self {
+            top,
+            right,
+            bottom,
+            left,
+        })
+    }
+}
+
+impl BarMargin {
+    fn validate(&mut self, field: &str) {
+        self.top.validate(field, "top");
+        self.right.validate(field, "right");
+        self.bottom.validate(field, "bottom");
+        self.left.validate(field, "left");
+    }
+}
+
+impl From<BarMargin> for (i32, i32, i32, i32) {
+    fn from(value: BarMargin) -> Self {
+        (
+            value.top.into(),
+            value.right.into(),
+            value.bottom.into(),
+            value.left.into(),
+        )
+    }
+}
+
+/// Per-edge inner spacing, deserialized with the CSS `padding` shorthand:
+/// 1 value = all edges, 2 = `[vertical, horizontal]`, 4 = `[top, right, bottom, left]`.
+///
+/// Unlike `margin` this stays inside the layer surface, so a solid bar keeps its
+/// full-width background and the bar still receives input at the screen edge.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct BarPadding {
+    pub top: MarginSize,
+    pub right: MarginSize,
+    pub bottom: MarginSize,
+    pub left: MarginSize,
+}
+
+impl<'de> Deserialize<'de> for BarPadding {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let [top, right, bottom, left] =
+            CssShorthand::<MarginSize>::deserialize(deserializer)?.expand()?;
+        Ok(Self {
+            top,
+            right,
+            bottom,
+            left,
+        })
+    }
+}
+
+impl BarPadding {
+    fn validate(&mut self, field: &str) {
+        self.top.validate(field, "top");
+        self.right.validate(field, "right");
+        self.bottom.validate(field, "bottom");
+        self.left.validate(field, "left");
+    }
+}
+
+/// A palette entry, resolved from the surface's theme when drawing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteColor {
+    Background(Option<BackgroundLevel>),
+    Primary(Shade),
+    Success(Shade),
+    Warning(Shade),
+    Danger(Shade),
+    Text,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Shade {
+    #[serde(skip)]
+    Base,
+    Weak,
+    Strong,
+}
+
+impl PaletteColor {
+    fn parse<E: de::Error>(value: &str) -> Result<Self, E> {
+        fn variant<'de, T: Deserialize<'de>, E: de::Error>(value: &'de str) -> Result<T, E> {
+            T::deserialize(de::value::StrDeserializer::new(value))
+        }
+        let shade = |shade: Option<&str>| shade.map_or(Ok(Shade::Base), variant);
+
+        let (name, variant_name) = match value.split_once('.') {
+            Some((name, variant_name)) => (name, Some(variant_name)),
+            None => (value, None),
+        };
+        Ok(match (name, variant_name) {
+            ("background", level) => PaletteColor::Background(level.map(variant).transpose()?),
+            ("primary", v) => PaletteColor::Primary(shade(v)?),
+            ("success", v) => PaletteColor::Success(shade(v)?),
+            ("warning", v) => PaletteColor::Warning(shade(v)?),
+            ("danger", v) => PaletteColor::Danger(shade(v)?),
+            ("text", None) => PaletteColor::Text,
+            _ => return Err(E::custom(format!("unknown palette color `{value}`"))),
+        })
+    }
+}
+
+/// A hex color (`#RRGGBB`) or a reference to the palette (`primary`, `background.strong`, ...).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorRef {
+    Hex(HexColor),
+    Palette(PaletteColor),
+}
+
+impl<'de> Deserialize<'de> for ColorRef {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.starts_with('#') {
+            HexColor::parse(&value)
+                .map(ColorRef::Hex)
+                .map_err(de::Error::custom)
+        } else {
+            PaletteColor::parse(&value).map(ColorRef::Palette)
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct Border {
+    pub width: f32,
+    pub color: ColorRef,
+}
+
+impl Default for Border {
+    fn default() -> Self {
+        Self {
+            width: 0.0,
+            color: ColorRef::Palette(PaletteColor::Background(Some(BackgroundLevel::Strong))),
+        }
+    }
+}
+
+impl Border {
+    fn validate(&mut self, field: &str) {
+        if !is_valid_length(self.width) {
+            warn!(
+                "{field}.width ({}) is not a valid length, using 0",
+                self.width
+            );
+            self.width = 0.0;
+        }
+    }
+}
+
+/// How a module's elements are wrapped in islands.
+#[derive(Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Grouping {
+    /// One island around all of the module's elements.
+    #[default]
+    Combined,
+    /// One island per element.
+    Individual,
+    /// No island.
+    None,
+}
+
+#[derive(Deserialize, Copy, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum FontSizeScale {
+    Xxs,
+    Xs,
+    Sm,
+    Md,
+    Lg,
+    Xl,
+    Xxl,
+}
+
+/// `appearance.modules.default`: the style of every module island.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ModuleDefaultStyle {
+    pub radius: Option<BarRadius>,
+    pub padding: Option<BarPadding>,
+    pub border: Option<Border>,
+    pub background: Option<ColorRef>,
+    pub grouping: Option<Grouping>,
+}
+
+/// `appearance.modules.group`: the style of the islands of module groups.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct GroupStyle {
+    pub radius: Option<BarRadius>,
+    pub padding: Option<BarPadding>,
+    pub border: Option<Border>,
+    pub background: Option<ColorRef>,
+    pub spacing: Option<MarginSize>,
+}
+
+/// `appearance.modules.<module>`: per-module overrides.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ModuleStyle {
+    pub radius: Option<BarRadius>,
+    pub padding: Option<BarPadding>,
+    pub border: Option<Border>,
+    pub background: Option<ColorRef>,
+    pub grouping: Option<Grouping>,
+    pub spacing: Option<MarginSize>,
+    pub text_color: Option<ColorRef>,
+    pub font_size: Option<FontSizeScale>,
+}
+
+/// The `[appearance.modules]` table: the reserved `default` and `group` keys,
+/// builtin modules by their section name (`system_info`), and custom modules
+/// under `custom` by their `name`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModulesAppearance {
+    pub default: ModuleDefaultStyle,
+    pub group: GroupStyle,
+    pub overrides: HashMap<ModuleName, ModuleStyle>,
+}
+
+impl<'de> Deserialize<'de> for ModulesAppearance {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ModulesAppearanceVisitor;
+
+        impl<'de> Visitor<'de> for ModulesAppearanceVisitor {
+            type Value = ModulesAppearance;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a table of module styles")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut modules = ModulesAppearance::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "default" => modules.default = map.next_value()?,
+                        "group" => modules.group = map.next_value()?,
+                        "custom" => {
+                            let custom: HashMap<String, ModuleStyle> = map.next_value()?;
+                            modules.overrides.extend(
+                                custom
+                                    .into_iter()
+                                    .map(|(name, style)| (ModuleName::Custom(name), style)),
+                            );
+                        }
+                        key => {
+                            let name = ModuleName::from_section(key)
+                                .ok_or_else(|| de::Error::custom(unknown_module(key)))?;
+                            modules.overrides.insert(name, map.next_value()?);
+                        }
+                    }
+                }
+                Ok(modules)
+            }
+        }
+
+        deserializer.deserialize_map(ModulesAppearanceVisitor)
+    }
+}
+
+impl ModulesAppearance {
+    fn validate(&mut self, custom_modules: &[CustomModuleDef]) {
+        let default = &mut self.default;
+        validate_style(
+            "appearance.modules.default",
+            &mut default.border,
+            &mut default.padding,
+            None,
+        );
+        let group = &mut self.group;
+        validate_style(
+            "appearance.modules.group",
+            &mut group.border,
+            &mut group.padding,
+            group.spacing.as_mut(),
+        );
+        for (name, style) in &mut self.overrides {
+            validate_style(
+                &format!("appearance.modules.{}", name.style_key()),
+                &mut style.border,
+                &mut style.padding,
+                style.spacing.as_mut(),
+            );
+        }
+
+        for name in self.overrides.keys() {
+            if let ModuleName::Custom(name) = name
+                && !custom_modules.iter().any(|module| module.name == *name)
+            {
+                warn!(
+                    "[appearance.modules.custom.{name}] doesn't match any [[CustomModule]], its style is unused"
+                );
+            }
+        }
+    }
+}
+
+fn unknown_module(key: &str) -> String {
+    match BUILTIN_MODULES.iter().find(|(layout, _, _)| *layout == key) {
+        Some((_, section, _)) => {
+            format!("unknown module `{key}` in [appearance.modules], use `{section}`")
+        }
+        None => format!(
+            "unknown module `{key}` in [appearance.modules], expected a builtin module like `system_info`, or `custom.{key}` for a custom module"
+        ),
+    }
+}
+
+fn validate_style(
+    field: &str,
+    border: &mut Option<Border>,
+    padding: &mut Option<BarPadding>,
+    spacing: Option<&mut MarginSize>,
+) {
+    if let Some(border) = border {
+        border.validate(&format!("{field}.border"));
+    }
+    if let Some(padding) = padding {
+        padding.validate(&format!("{field}.padding"));
+    }
+    if let Some(spacing) = spacing {
+        spacing.validate(field, "spacing");
+    }
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct BarAppearance {
+    pub surface: BarSurface,
+    pub radius: BarRadius,
+    pub margin: BarMargin,
+    pub padding: BarPadding,
+    pub border: Border,
+}
+
+impl Default for BarAppearance {
+    fn default() -> Self {
+        let xxs = MarginSize::SpaceSize(SpaceSize::Xxs);
+        Self {
+            surface: BarSurface::default(),
+            radius: BarRadius::default(),
+            margin: BarMargin::default(),
+            padding: BarPadding {
+                top: xxs,
+                right: xxs,
+                bottom: xxs,
+                left: xxs,
+            },
+            border: Border::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Default, Clone, Copy, Debug)]
 #[serde(default)]
 pub struct MenuAppearance {
-    #[serde(deserialize_with = "opacity_deserializer")]
-    pub opacity: f32,
     pub backdrop: f32,
 }
 
-impl Default for MenuAppearance {
+/// A layer-shell surface. Each one is drawn with its own theme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    Bar,
+    Menu,
+    Osd,
+    Notifications,
+}
+
+impl Surface {
+    pub const ALL: [Surface; 4] = [
+        Surface::Bar,
+        Surface::Menu,
+        Surface::Osd,
+        Surface::Notifications,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Opacity {
+    default: f32,
+    bar: Option<f32>,
+    menu: Option<f32>,
+    osd: Option<f32>,
+    notifications: Option<f32>,
+}
+
+impl Opacity {
+    pub fn get(&self, surface: Surface) -> f32 {
+        match surface {
+            Surface::Bar => self.bar,
+            Surface::Menu => self.menu,
+            Surface::Osd => self.osd,
+            Surface::Notifications => self.notifications,
+        }
+        .unwrap_or(self.default)
+    }
+}
+
+impl Default for Opacity {
     fn default() -> Self {
         Self {
-            opacity: default_opacity(),
-            backdrop: f32::default(),
+            default: 1.0,
+            bar: None,
+            menu: None,
+            osd: None,
+            notifications: None,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for Opacity {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct OpacityVisitor;
+
+        impl<'de> Visitor<'de> for OpacityVisitor {
+            type Value = Opacity;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(
+                    "a number between 0.0 and 1.0, or a table with `default` and per-surface overrides",
+                )
+            }
+
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Opacity, E> {
+                Ok(Opacity {
+                    default: check_opacity(v).map_err(E::custom)?,
+                    ..Opacity::default()
+                })
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Opacity, E> {
+                self.visit_f64(v as f64)
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Opacity, E> {
+                self.visit_f64(v as f64)
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<Opacity, M::Error> {
+                #[derive(Deserialize)]
+                struct Table {
+                    default: Option<f64>,
+                    bar: Option<f64>,
+                    menu: Option<f64>,
+                    osd: Option<f64>,
+                    notifications: Option<f64>,
+                }
+
+                let table = Table::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                let check =
+                    |v: Option<f64>| v.map(check_opacity).transpose().map_err(de::Error::custom);
+
+                Ok(Opacity {
+                    default: check(table.default)?.unwrap_or(1.0),
+                    bar: check(table.bar)?,
+                    menu: check(table.menu)?,
+                    osd: check(table.osd)?,
+                    notifications: check(table.notifications)?,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(OpacityVisitor)
     }
 }
 
@@ -890,12 +1650,13 @@ impl Default for MenuAppearance {
 #[serde(default)]
 pub struct Appearance {
     pub font_name: Option<String>,
+    pub font_weight: FontWeight,
     #[serde(deserialize_with = "scale_factor_deserializer")]
     pub scale_factor: f64,
-    pub style: AppearanceStyle,
-    #[serde(deserialize_with = "opacity_deserializer")]
-    pub opacity: f32,
+    pub opacity: Opacity,
+    pub bar: BarAppearance,
     pub menu: MenuAppearance,
+    pub modules: ModulesAppearance,
     pub background_color: BackgroundAppearanceColor,
     pub primary_color: AppearanceColor,
     pub success_color: AppearanceColor,
@@ -904,6 +1665,65 @@ pub struct Appearance {
     pub text_color: AppearanceColor,
     pub workspace_colors: Vec<AppearanceColor>,
     pub special_workspace_colors: Option<Vec<AppearanceColor>>,
+    /// Blur the wallpaper behind ashell's translucent surfaces via
+    /// `ext-background-effect-v1`. No-op where the protocol is unsupported.
+    pub blur: BlurMode,
+}
+
+/// Weight of the face picked from `font_name`.
+#[derive(Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FontWeight {
+    Thin,
+    ExtraLight,
+    Light,
+    #[default]
+    Normal,
+    Medium,
+    SemiBold,
+    Bold,
+    ExtraBold,
+    Black,
+}
+
+impl FontWeight {
+    /// The CSS / OpenType numeric weight.
+    pub fn value(self) -> u16 {
+        match self {
+            Self::Thin => 100,
+            Self::ExtraLight => 200,
+            Self::Light => 300,
+            Self::Normal => 400,
+            Self::Medium => 500,
+            Self::SemiBold => 600,
+            Self::Bold => 700,
+            Self::ExtraBold => 800,
+            Self::Black => 900,
+        }
+    }
+}
+
+/// When to ask the compositor for background blur.
+#[derive(Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BlurMode {
+    /// Blur when `opacity < 1`; blurring an opaque surface would not show.
+    #[default]
+    Auto,
+    /// Always ask, even at full opacity.
+    Always,
+    /// Never ask.
+    Never,
+}
+
+impl BlurMode {
+    pub fn enabled(self, opacity: f32) -> bool {
+        match self {
+            Self::Auto => opacity < 1.0,
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
 }
 
 static PRIMARY: HexColor = HexColor::rgb(122, 162, 247);
@@ -929,37 +1749,28 @@ where
     Ok(v)
 }
 
-fn opacity_deserializer<'de, D>(deserializer: D) -> Result<f32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let v = f32::deserialize(deserializer)?;
-
+fn check_opacity(v: f64) -> Result<f32, &'static str> {
     if v < 0.0 {
-        return Err(serde::de::Error::custom("Opacity cannot be negative"));
+        return Err("Opacity cannot be negative");
     }
 
     if v > 1.0 {
-        return Err(serde::de::Error::custom(
-            "Opacity cannot be greater than 1.0",
-        ));
+        return Err("Opacity cannot be greater than 1.0");
     }
 
-    Ok(v)
-}
-
-fn default_opacity() -> f32 {
-    1.0
+    Ok(v as f32)
 }
 
 impl Default for Appearance {
     fn default() -> Self {
         Self {
             font_name: None,
+            font_weight: FontWeight::default(),
             scale_factor: 1.0,
-            style: AppearanceStyle::default(),
-            opacity: default_opacity(),
+            opacity: Opacity::default(),
+            bar: BarAppearance::default(),
             menu: MenuAppearance::default(),
+            modules: ModulesAppearance::default(),
             background_color: BackgroundAppearanceColor::Complete {
                 base: HexColor::rgb(26, 27, 38),
                 weakest: None,
@@ -981,6 +1792,7 @@ impl Default for Appearance {
                 AppearanceColor::Simple(HexColor::rgb(158, 206, 106)),
             ],
             special_workspace_colors: None,
+            blur: BlurMode::default(),
         }
     }
 }
@@ -1000,7 +1812,7 @@ pub enum Layer {
     Overlay,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ModuleName {
     Updates,
     Workspaces,
@@ -1015,6 +1827,71 @@ pub enum ModuleName {
     MediaPlayer,
     Custom(String),
     Notifications,
+}
+
+/// Each builtin module's layout name and its snake_case name, used for its
+/// settings section and its `[appearance.modules]` key.
+const BUILTIN_MODULES: [(&str, &str, ModuleName); 12] = [
+    ("Updates", "updates", ModuleName::Updates),
+    ("Workspaces", "workspaces", ModuleName::Workspaces),
+    ("WindowTitle", "window_title", ModuleName::WindowTitle),
+    ("SystemInfo", "system_info", ModuleName::SystemInfo),
+    (
+        "KeyboardLayout",
+        "keyboard_layout",
+        ModuleName::KeyboardLayout,
+    ),
+    (
+        "KeyboardSubmap",
+        "keyboard_submap",
+        ModuleName::KeyboardSubmap,
+    ),
+    ("Tray", "tray", ModuleName::Tray),
+    ("Notifications", "notifications", ModuleName::Notifications),
+    ("Tempo", "tempo", ModuleName::Tempo),
+    ("Privacy", "privacy", ModuleName::Privacy),
+    ("Settings", "settings", ModuleName::Settings),
+    ("MediaPlayer", "media_player", ModuleName::MediaPlayer),
+];
+
+impl ModuleName {
+    fn builtin(&self) -> Option<&'static (&'static str, &'static str, ModuleName)> {
+        BUILTIN_MODULES.iter().find(|(_, _, module)| module == self)
+    }
+
+    fn from_section(section: &str) -> Option<Self> {
+        BUILTIN_MODULES
+            .iter()
+            .find(|(_, name, _)| *name == section)
+            .map(|(_, _, module)| module.clone())
+    }
+
+    /// The key of the module's table in `[appearance.modules]`.
+    fn style_key(&self) -> String {
+        match self {
+            ModuleName::Custom(name) => format!("custom.{name}"),
+            builtin => builtin
+                .builtin()
+                .expect("every builtin module has a name")
+                .1
+                .to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Display for ModuleName {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let name = match self {
+            ModuleName::Custom(name) => name,
+            builtin => {
+                builtin
+                    .builtin()
+                    .expect("every builtin module has a name")
+                    .0
+            }
+        };
+        f.write_str(name)
+    }
 }
 
 impl<'de> Deserialize<'de> for ModuleName {
@@ -1032,21 +1909,13 @@ impl<'de> Deserialize<'de> for ModuleName {
             where
                 E: serde::de::Error,
             {
-                Ok(match value {
-                    "Updates" => ModuleName::Updates,
-                    "Workspaces" => ModuleName::Workspaces,
-                    "WindowTitle" => ModuleName::WindowTitle,
-                    "SystemInfo" => ModuleName::SystemInfo,
-                    "KeyboardLayout" => ModuleName::KeyboardLayout,
-                    "KeyboardSubmap" => ModuleName::KeyboardSubmap,
-                    "Tray" => ModuleName::Tray,
-                    "Notifications" => ModuleName::Notifications,
-                    "Tempo" => ModuleName::Tempo,
-                    "Privacy" => ModuleName::Privacy,
-                    "Settings" => ModuleName::Settings,
-                    "MediaPlayer" => ModuleName::MediaPlayer,
-                    other => ModuleName::Custom(other.to_string()),
-                })
+                Ok(BUILTIN_MODULES
+                    .iter()
+                    .find(|(name, _, _)| *name == value)
+                    .map_or_else(
+                        || ModuleName::Custom(value.to_string()),
+                        |(_, _, module)| module.clone(),
+                    ))
             }
         }
         deserializer.deserialize_str(ModuleNameVisitor)
@@ -1068,6 +1937,19 @@ pub struct Modules {
     pub center: Vec<ModuleDef>,
     #[serde(default)]
     pub right: Vec<ModuleDef>,
+}
+
+impl Modules {
+    pub fn contains(&self, target: &ModuleName) -> bool {
+        self.left
+            .iter()
+            .chain(&self.center)
+            .chain(&self.right)
+            .any(|def| match def {
+                ModuleDef::Single(m) => m == target,
+                ModuleDef::Group(ms) => ms.contains(target),
+            })
+    }
 }
 
 impl Default for Modules {
@@ -1160,7 +2042,7 @@ pub struct CustomModuleDef {
     #[serde(default)]
     pub icon: Option<String>,
 
-    /// yields json lines containing text, alt, (pot tooltip)
+    /// yields json lines containing text, alt, (optionally tooltip)
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub listen_cmd: Option<String>,
     /// map of regex -> icon
@@ -1205,37 +2087,94 @@ impl Default for OsdConfig {
     }
 }
 
-pub fn get_config(path: Option<PathBuf>) -> Result<(Config, PathBuf), Box<dyn Error + Send>> {
-    match path {
-        Some(p) => {
-            info!("Config path provided {p:?}");
-            expand_path(p).and_then(|expanded| {
-                if !expanded.exists() {
-                    Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Config file does not exist: {}", expanded.display()),
-                    )))
-                } else {
-                    Ok((read_config(&expanded).unwrap_or_default(), expanded))
-                }
-            })
-        }
-        None => expand_path(PathBuf::from(DEFAULT_CONFIG_FILE_PATH)).map(|expanded| {
-            // Safety: DEFAULT_CONFIG_FILE_PATH is "~/.config/ashell/config.toml" which
-            // always has directory components. shellexpand only expands ~/$HOME and never
-            // strips path components, so .parent() always returns Some.
-            let parent = expanded
-                .parent()
-                .expect("Failed to get default config parent directory");
-
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .expect("Failed to create default config parent directory");
-            }
-
-            (read_config(&expanded).unwrap_or_default(), expanded)
-        }),
+/// Parses just the `[logging]` table, before the logger exists: no `log::*`
+/// here, problems go to `stderr`.
+pub fn read_logging_config(path: Option<&PathBuf>) -> LoggingConfig {
+    #[derive(Deserialize)]
+    struct LoggingConfigWrapper {
+        #[serde(default)]
+        logging: LoggingConfig,
     }
+
+    let config_path = match resolve_config_path(path.map(PathBuf::as_path)) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "ashell: warning: cannot expand the config path: {e}, using the default logging setup"
+            );
+            return LoggingConfig::default();
+        }
+    };
+
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "ashell: warning: cannot read {}: {e}, using the default logging setup",
+                    config_path.display()
+                );
+            }
+            return LoggingConfig::default();
+        }
+    };
+
+    match toml::from_str::<LoggingConfigWrapper>(&content) {
+        Ok(wrapper) => wrapper.logging,
+        Err(e) => {
+            eprintln!(
+                "ashell: warning: cannot read the [logging] section of {}, using the default logging setup:\n{e}",
+                config_path.display()
+            );
+            LoggingConfig::default()
+        }
+    }
+}
+
+fn resolve_config_path(path: Option<&Path>) -> Result<PathBuf, Box<dyn Error + Send>> {
+    expand_path(match path {
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from(DEFAULT_CONFIG_FILE_PATH),
+    })
+}
+
+/// Resolve the path in the caller's environment, so the daemon receives an
+/// absolute path whatever its own working directory is.
+pub fn resolve_config_arg(s: &str) -> Result<PathBuf, String> {
+    let expanded = shellexpand::full(s).map_err(|e| e.to_string())?;
+    std::env::current_dir()
+        .map_err(|e| e.to_string())?
+        .join(expanded.as_ref())
+        .canonicalize()
+        .map_err(|e| format!("invalid config file {s}: {e}"))
+}
+
+pub fn get_config(path: Option<&PathBuf>) -> Result<(Config, PathBuf), Box<dyn Error + Send>> {
+    let explicit = path.is_some();
+    let expanded = resolve_config_path(path.map(|p| p.as_path()))?;
+
+    if explicit {
+        info!("Config path provided {expanded:?}");
+
+        if !expanded.exists() {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Config file does not exist: {}", expanded.display()),
+            )));
+        }
+    } else {
+        // DEFAULT_CONFIG_FILE_PATH has a parent and shellexpand never strips components.
+        let parent = expanded
+            .parent()
+            .expect("Failed to get default config parent directory");
+
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .expect("Failed to create default config parent directory");
+        }
+    }
+
+    Ok((read_config(&expanded).unwrap_or_default(), expanded))
 }
 
 fn expand_path(path: PathBuf) -> Result<PathBuf, Box<dyn Error + Send>> {
@@ -1246,16 +2185,26 @@ fn expand_path(path: PathBuf) -> Result<PathBuf, Box<dyn Error + Send>> {
     Ok(PathBuf::from(expanded.to_string()))
 }
 
-fn read_config(path: &Path) -> Result<Config, Box<dyn Error + Send>> {
+pub fn read_config(path: &Path) -> Result<Config, Box<dyn Error + Send>> {
     let content =
         std::fs::read_to_string(path).map_err(|e| Box::new(e) as Box<dyn Error + Send>)?;
 
     info!("Decoding config file {path:?}");
 
-    let res = toml::from_str::<Config>(&content);
+    let de =
+        toml::Deserializer::parse(&content).map_err(|e| Box::new(e) as Box<dyn Error + Send>)?;
+    let mut unknown_fields = Vec::new();
+    let res = serde_ignored::deserialize(de, |path| {
+        unknown_fields.push(path.to_string());
+    });
 
     match res {
         Ok(config) => {
+            for field in &unknown_fields {
+                let msg = format!("Unknown configuration field ignored: {field}");
+                warn!("{msg}");
+                eprintln!("ashell: warning: {msg}");
+            }
             info!("Config file loaded successfully");
             let mut config: Config = config;
             config.validate();
@@ -1384,4 +2333,250 @@ pub fn subscription(path: &Path) -> Subscription<Message> {
             }
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml: &str) -> Result<Config, toml::de::Error> {
+        toml::from_str(toml).map(|mut config: Config| {
+            config.validate();
+            config
+        })
+    }
+
+    fn ignored_fields(toml: &str) -> Vec<String> {
+        let mut ignored = Vec::new();
+        let _: Config =
+            serde_ignored::deserialize(toml::Deserializer::parse(toml).unwrap(), |path| {
+                ignored.push(path.to_string())
+            })
+            .unwrap();
+        ignored
+    }
+
+    const BACKGROUND_STRONG: ColorRef =
+        ColorRef::Palette(PaletteColor::Background(Some(BackgroundLevel::Strong)));
+
+    #[test]
+    fn style_defaults_keep_current_look() {
+        let appearance = parse("").unwrap().appearance;
+        assert_eq!(appearance.bar.border.width, 0.0);
+        assert_eq!(appearance.bar.border.color, BACKGROUND_STRONG);
+        assert_eq!(appearance.modules, ModulesAppearance::default());
+    }
+
+    #[test]
+    fn parses_issue_example() {
+        let modules = parse(
+            r##"
+            [appearance.bar]
+            border = { width = 1, color = "background.strong" }
+
+            [appearance.modules.default]
+            radius = "lg"
+            padding = "none"
+            border = { width = 1, color = "background.strong" }
+            background = "background"
+            grouping = "combined"
+
+            [appearance.modules.group]
+            radius = "md"
+            padding = "xxs"
+            border = { width = 1, color = "primary" }
+            background = "background.weak"
+            spacing = "xs"
+
+            [appearance.modules.system_info]
+            grouping = "individual"
+            spacing = "xs"
+            radius = "md"
+            border = { width = 1, color = "#414868" }
+            text_color = "primary"
+
+            [appearance.modules.workspaces]
+            font_size = "sm"
+
+            [appearance.modules.custom.my_custom_module]
+            font_size = "lg"
+            "##,
+        )
+        .unwrap()
+        .appearance
+        .modules;
+
+        assert_eq!(modules.default.grouping, Some(Grouping::Combined));
+        assert_eq!(
+            modules.default.background,
+            Some(ColorRef::Palette(PaletteColor::Background(None)))
+        );
+        assert_eq!(
+            modules.group.border.unwrap().color,
+            ColorRef::Palette(PaletteColor::Primary(Shade::Base))
+        );
+        assert_eq!(
+            modules.group.spacing,
+            Some(MarginSize::SpaceSize(SpaceSize::Xs))
+        );
+
+        let system_info = modules.overrides[&ModuleName::SystemInfo];
+        assert_eq!(system_info.grouping, Some(Grouping::Individual));
+        assert_eq!(
+            system_info.border.unwrap().color,
+            ColorRef::Hex(HexColor::rgb(0x41, 0x48, 0x68))
+        );
+        assert_eq!(
+            system_info.text_color,
+            Some(ColorRef::Palette(PaletteColor::Primary(Shade::Base)))
+        );
+        assert_eq!(system_info.font_size, None);
+
+        assert_eq!(
+            modules.overrides[&ModuleName::Workspaces].font_size,
+            Some(FontSizeScale::Sm)
+        );
+        assert_eq!(
+            modules.overrides[&ModuleName::Custom("my_custom_module".into())].font_size,
+            Some(FontSizeScale::Lg)
+        );
+    }
+
+    #[test]
+    fn border_fields_default_individually() {
+        let bar = parse("[appearance.bar]\nborder = { width = 2 }")
+            .unwrap()
+            .appearance
+            .bar;
+        assert_eq!(bar.border.width, 2.0);
+        assert_eq!(bar.border.color, BACKGROUND_STRONG);
+    }
+
+    #[test]
+    fn negative_border_width_falls_back_to_zero() {
+        let modules = parse("[appearance.modules.default]\nborder = { width = -1 }")
+            .unwrap()
+            .appearance
+            .modules;
+        assert_eq!(modules.default.border.unwrap().width, 0.0);
+    }
+
+    #[test]
+    fn parses_palette_references() {
+        use PaletteColor::*;
+        let cases = [
+            ("background", Background(None)),
+            (
+                "background.weakest",
+                Background(Some(BackgroundLevel::Weakest)),
+            ),
+            (
+                "background.neutral",
+                Background(Some(BackgroundLevel::Neutral)),
+            ),
+            (
+                "background.strongest",
+                Background(Some(BackgroundLevel::Strongest)),
+            ),
+            ("primary.weak", Primary(Shade::Weak)),
+            ("success", Success(Shade::Base)),
+            ("warning.strong", Warning(Shade::Strong)),
+            ("danger.weak", Danger(Shade::Weak)),
+            ("text", Text),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                PaletteColor::parse::<de::value::Error>(name),
+                Ok(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_colors() {
+        for color in [
+            "accent",
+            "primary.base",
+            "primary.strongest",
+            "background.base",
+            "text.weak",
+            "#zzzzzz",
+        ] {
+            let toml = format!("[appearance.modules.default]\nbackground = \"{color}\"");
+            assert!(parse(&toml).is_err(), "{color} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_grouping_and_font_size() {
+        assert!(parse("[appearance.modules.default]\ngrouping = \"all\"").is_err());
+        assert!(parse("[appearance.modules.tray]\nfont_size = \"huge\"").is_err());
+    }
+
+    #[test]
+    fn module_overrides_use_section_names() {
+        let error = |toml: &str| parse(toml).unwrap_err().message().to_owned();
+
+        assert_eq!(
+            error("[appearance.modules.SystemInfo]"),
+            "unknown module `SystemInfo` in [appearance.modules], use `system_info`"
+        );
+        assert!(error("[appearance.modules.my_module]").contains("`custom.my_module`"));
+    }
+
+    #[test]
+    fn custom_overrides_stay_apart_from_builtins() {
+        let modules = parse(
+            r#"
+            [appearance.modules.tray]
+            font_size = "sm"
+
+            [appearance.modules.custom.tray]
+            font_size = "lg"
+
+            [appearance.modules.custom.default]
+            font_size = "xs"
+            "#,
+        )
+        .unwrap()
+        .appearance
+        .modules;
+
+        assert_eq!(
+            modules.overrides[&ModuleName::Tray].font_size,
+            Some(FontSizeScale::Sm)
+        );
+        assert_eq!(
+            modules.overrides[&ModuleName::Custom("tray".into())].font_size,
+            Some(FontSizeScale::Lg)
+        );
+        assert_eq!(
+            modules.overrides[&ModuleName::Custom("default".into())].font_size,
+            Some(FontSizeScale::Xs)
+        );
+        assert_eq!(modules.default, ModuleDefaultStyle::default());
+    }
+
+    #[test]
+    fn reports_options_outside_their_table() {
+        let ignored = ignored_fields(
+            r#"
+            [appearance.modules.default]
+            font_size = "sm"
+            spacing = "xs"
+
+            [appearance.modules.group]
+            grouping = "none"
+            "#,
+        );
+        assert_eq!(
+            ignored,
+            [
+                "appearance.modules.default.font_size",
+                "appearance.modules.default.spacing",
+                "appearance.modules.group.grouping",
+            ]
+        );
+    }
 }

@@ -1,42 +1,192 @@
 use crate::{
     components::divider,
     components::icons::{StaticIcon, icon, icon_button},
-    components::{ButtonSize, MenuSize},
-    config::{MediaPlayerFormat, MediaPlayerModuleConfig},
+    components::scrollable,
+    components::{ButtonKind, ButtonSize, MenuSize},
+    config::{
+        MediaPlayerFormat, MediaPlayerIndicatorControls, MediaPlayerModuleConfig,
+        MediaPlayerTextField, MediaPlayerVisualizer,
+    },
     services::{
         ReadOnlyService, Service, ServiceEvent,
         mpris::{
-            MprisPlayerCommand, MprisPlayerData, MprisPlayerService, PlaybackStatus, PlayerCommand,
+            MprisPlayerCommand, MprisPlayerData, MprisPlayerMetadata, MprisPlayerService,
+            PlaybackStatus, PlayerCommand,
         },
     },
     t,
     theme::use_theme,
-    utils::truncate_text,
+    utils::{
+        remote_value::{self, Remote},
+        truncate_text,
+    },
+    xdg,
 };
 use iced::{
-    Background, Border, Element, Length, Subscription, Task, Theme,
+    Color, Element, Length, Subscription, Task,
     alignment::Vertical,
-    widget::{column, container, image, row, slider, space, text},
+    futures::SinkExt,
+    gradient::ColorStop,
+    stream::channel,
+    widget::{
+        Stack,
+        canvas::{self, Canvas, Fill, Frame, Geometry, Path},
+        column, container, image, row, slider, space, text,
+    },
 };
+use std::{any::TypeId, collections::HashMap};
+
+/// Percentage points the scroll wheel moves the active player's volume per tick.
+const VOLUME_SCROLL_STEP: f64 = 5.0;
+
+const VISUALIZER_BAR_COUNT: usize = 32;
+
+const VISUALIZER_BAR_MIN_WIDTH: f32 = 2.0;
+const VISUALIZER_BAR_GAP: f32 = 2.0;
+const VISUALIZER_BG_BAR_MAX_WIDTH: f32 = 8.0;
+const VISUALIZER_BESIDE_BAR_MAX_WIDTH: f32 = 4.0;
+const VISUALIZER_BESIDE_WIDTH: f32 = 64.0;
+const VISUALIZER_BG_MIN_WIDTH: f32 = 64.0;
+
+struct VisualizerCanvas {
+    bars: Vec<f32>,
+    low: Color,
+    mid: Color,
+    high: Color,
+    opacity: f32,
+    // Corner radius of the surface behind the bars; the outermost bars round
+    // their outer corners to match it (0 to keep square bars).
+    radius: f32,
+    min_bar_width: f32,
+    max_bar_width: f32,
+    gap: f32,
+    inset: f32,
+}
+
+impl<M> canvas::Program<M> for VisualizerCanvas {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+
+        if self.bars.is_empty() {
+            return vec![frame.into_geometry()];
+        }
+
+        let src = self.bars.len();
+        let avail = (bounds.width - 2.0 * self.inset).max(self.min_bar_width);
+        let n =
+            (((avail + self.gap) / (self.max_bar_width + self.gap)).ceil() as usize).clamp(1, src);
+        let bar_width = ((avail - (n - 1) as f32 * self.gap) / n as f32).max(self.min_bar_width);
+        let step = bar_width + self.gap;
+
+        // The gradient is vertical, so its colour depends only on `y`: every bar
+        // shares the same fill. Build it once instead of per bar.
+        let grad = canvas::gradient::Linear::new(
+            iced::Point::new(0.0, 0.0),
+            iced::Point::new(0.0, bounds.height),
+        )
+        .add_stops([
+            ColorStop {
+                offset: 0.0,
+                color: self.high.scale_alpha(self.opacity),
+            },
+            ColorStop {
+                offset: 0.5,
+                color: self.mid.scale_alpha(self.opacity),
+            },
+            ColorStop {
+                offset: 1.0,
+                color: self.low.scale_alpha(self.opacity),
+            },
+        ]);
+        let fill = Fill {
+            style: canvas::Style::Gradient(canvas::Gradient::Linear(grad)),
+            ..Fill::default()
+        };
+
+        for i in 0..n {
+            let value = self.bars[(i * src / n).min(src - 1)];
+            let height = value * bounds.height;
+            let x = self.inset + i as f32 * step;
+            let y = bounds.height - height;
+            let position = iced::Point::new(x, y);
+            let size = iced::Size::new(bar_width, height);
+
+            let is_first = i == 0;
+            let is_last = i == n - 1;
+            let rect = if self.radius > 0.0 && (is_first || is_last) {
+                // Match the outer corners of the first/last bar to the surface
+                // rounding; top corners only when the bar reaches the top edge.
+                let reaches_top = y <= self.radius;
+                let radius = iced::border::Radius {
+                    top_left: if is_first && reaches_top {
+                        self.radius
+                    } else {
+                        0.0
+                    },
+                    bottom_left: if is_first { self.radius } else { 0.0 },
+                    top_right: if is_last && reaches_top {
+                        self.radius
+                    } else {
+                        0.0
+                    },
+                    bottom_right: if is_last { self.radius } else { 0.0 },
+                };
+                Path::rounded_rectangle(position, size, radius)
+            } else {
+                Path::rectangle(position, size)
+            };
+
+            frame.fill(&rect, fill);
+        }
+
+        vec![frame.into_geometry()]
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Prev(String),
     PlayPause(String),
     Next(String),
-    SetVolume(String, f64),
+    Volume(String, remote_value::Message<f64>),
+    /// Focus the player's window and close the menu.
+    Raise(String),
+    ActivePrev,
+    ActivePlayPause,
+    ActiveNext,
+    ActiveVolumeUp,
+    ActiveVolumeDown,
     Event(ServiceEvent<MprisPlayerService>),
     ConfigReloaded(MediaPlayerModuleConfig),
+    Bars(Vec<f32>),
+    MenuOpened,
 }
 
 pub enum Action {
     None,
     Command(Task<Message>),
+    CommandAndCloseMenu(Task<Message>),
 }
 
 pub struct MediaPlayer {
     config: MediaPlayerModuleConfig,
     service: Option<MprisPlayerService>,
+    bars: Vec<f32>,
+    last_active: Option<String>,
+    /// Per-player volume, keyed by MPRIS service name. Volume changes only come
+    /// back over D-Bus, so a burst of scroll events would otherwise all compute
+    /// from the same stale value; [`Remote`] applies each step optimistically and
+    /// falls back to the received value once the interaction stops.
+    volumes: HashMap<String, Remote<f64>>,
 }
 
 impl MediaPlayer {
@@ -44,7 +194,82 @@ impl MediaPlayer {
         Self {
             config,
             service: None,
+            bars: Vec::new(),
+            last_active: None,
+            volumes: HashMap::new(),
         }
+    }
+
+    /// The player to represent in the bar: the one currently playing, or the
+    /// last one that was playing, or the first known player when nothing is
+    /// playing.
+    fn active_player(&self) -> Option<&MprisPlayerData> {
+        let players = self.service.as_ref()?.players();
+        players
+            .iter()
+            .find(|p| p.state == PlaybackStatus::Playing)
+            .or_else(|| {
+                players
+                    .iter()
+                    .find(|p| Some(p.service.as_str()) == self.last_active.as_deref())
+            })
+            .or_else(|| players.first())
+    }
+
+    fn is_playing(&self) -> bool {
+        self.active_player().map(|p| p.state) == Some(PlaybackStatus::Playing)
+    }
+
+    pub fn indicator_controls(&self) -> MediaPlayerIndicatorControls {
+        self.config.indicator_controls
+    }
+
+    /// Mirror the volumes reported over D-Bus into the optimistic cache and drop
+    /// entries for players that went away.
+    fn sync_volumes(&mut self) {
+        let Some(service) = self.service.as_ref() else {
+            self.volumes.clear();
+            return;
+        };
+        let players = service.players();
+        self.volumes.retain(|name, _| {
+            players
+                .iter()
+                .any(|p| &p.service == name && p.volume.is_some())
+        });
+        for player in players {
+            if let Some(volume) = player.volume {
+                match self.volumes.get_mut(&player.service) {
+                    Some(remote) => remote.receive(volume),
+                    None => {
+                        self.volumes
+                            .insert(player.service.clone(), Remote::new(volume));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The volume to display and to compute the next step from: the optimistic
+    /// one while the user is interacting, the received one otherwise.
+    fn volume_of(&self, service_name: &str) -> Option<f64> {
+        self.volumes.get(service_name).map(Remote::value)
+    }
+
+    fn refresh_last_active(&mut self) {
+        if let Some(playing) = self.service.as_ref().and_then(|s| {
+            s.players()
+                .iter()
+                .find(|p| p.state == PlaybackStatus::Playing)
+        }) {
+            self.last_active = Some(playing.service.clone());
+        }
+    }
+
+    /// `menu_visualizer` only draws inside the menu, so it must not keep cava
+    /// running — and re-rendering every bar surface — while the menu is closed.
+    fn visualizer_enabled(&self, menu_open: bool) -> bool {
+        self.config.indicator_visualizer.is_some() || (self.config.menu_visualizer && menu_open)
     }
 
     pub fn update(&mut self, message: Message) -> Action {
@@ -54,17 +279,44 @@ impl MediaPlayer {
                 Action::Command(self.handle_command(s, PlayerCommand::PlayPause))
             }
             Message::Next(s) => Action::Command(self.handle_command(s, PlayerCommand::Next)),
-            Message::SetVolume(s, v) => {
-                Action::Command(self.handle_command(s, PlayerCommand::Volume(v)))
+            Message::Volume(service_name, message) => {
+                let command = match message.value() {
+                    Some(volume) => {
+                        self.handle_command(service_name.clone(), PlayerCommand::Volume(volume))
+                    }
+                    None => Task::none(),
+                };
+                let remote = match self.volumes.get_mut(&service_name) {
+                    Some(remote) => remote
+                        .update(message)
+                        .map(move |m| Message::Volume(service_name.clone(), m)),
+                    None => Task::none(),
+                };
+                Action::Command(Task::batch([command, remote]))
             }
+            Message::Raise(s) => {
+                Action::CommandAndCloseMenu(self.handle_command(s, PlayerCommand::Raise))
+            }
+            Message::ActivePrev => self.active_command(PlayerCommand::Prev),
+            Message::ActivePlayPause => self.active_command(PlayerCommand::PlayPause),
+            Message::ActiveNext => self.active_command(PlayerCommand::Next),
+            Message::ActiveVolumeUp => self.active_volume_command(VOLUME_SCROLL_STEP),
+            Message::ActiveVolumeDown => self.active_volume_command(-VOLUME_SCROLL_STEP),
             Message::Event(event) => match event {
                 ServiceEvent::Init(s) => {
                     self.service = Some(s);
+                    self.refresh_last_active();
+                    self.sync_volumes();
                     Action::None
                 }
                 ServiceEvent::Update(d) => {
                     if let Some(service) = self.service.as_mut() {
                         service.update(d);
+                    }
+                    self.refresh_last_active();
+                    self.sync_volumes();
+                    if !self.is_playing() {
+                        self.bars.clear();
                     }
                     Action::None
                 }
@@ -74,137 +326,185 @@ impl MediaPlayer {
                 self.config = c;
                 Action::None
             }
+            Message::Bars(bars) => {
+                self.bars = bars;
+                Action::None
+            }
+            Message::MenuOpened => {
+                // With only `menu_visualizer` enabled, cava stops when the menu
+                // closes, so the last frame would sit frozen behind the card
+                // until a fresh frame arrives. Drop it instead.
+                if !self.visualizer_enabled(false) {
+                    self.bars.clear();
+                }
+                Action::None
+            }
         }
     }
 
-    pub fn menu_view<'a>(&'a self) -> Element<'a, Message> {
-        let (space, font_size, opacity, radius) =
-            use_theme(|theme| (theme.space, theme.font_size, theme.opacity, theme.radius));
+    pub fn menu_view<'a>(&'a self, is_closing: bool) -> Element<'a, Message> {
+        let (space, font_size, radius, palette) =
+            use_theme(|theme| (theme.space, theme.font_size, theme.radius, theme.palette));
         container(match &self.service {
             None => Into::<Element<'a, Message>>::into(text(t!("media-player-not-connected"))),
             Some(service) => column!(
                 text(t!("media-player-heading")).size(font_size.lg),
                 divider(),
-                column(service.players().iter().map(|d| {
-                    const LEFT_COLUMN_WIDTH: Length = Length::FillPortion(3);
-                    const RIGHT_COLUMN_WIDTH: Length = Length::FillPortion(2);
-                    let m = d.metadata.as_ref();
-                    let title = m
-                        .and_then(|m| m.title.clone())
-                        .unwrap_or_else(|| t!("media-player-no-title"));
-                    let artists = m
-                        .and_then(|m| m.artists.clone())
-                        .map(|a| a.join(", "))
-                        .unwrap_or_else(|| t!("media-player-unknown-artist"));
-                    let album = m
-                        .and_then(|m| m.album.clone())
-                        .unwrap_or_else(|| t!("media-player-unknown-album"));
-                    let title = text(truncate_text(&title, self.config.max_title_length))
-                        .wrapping(text::Wrapping::WordOrGlyph)
-                        .width(Length::Fill);
-                    let artists = text(truncate_text(&artists, self.config.max_title_length))
-                        .wrapping(text::Wrapping::WordOrGlyph)
-                        .size(font_size.sm)
-                        .width(Length::Fill);
-                    let album = text(truncate_text(&album, self.config.max_title_length))
-                        .wrapping(text::Wrapping::WordOrGlyph)
-                        .size(font_size.sm)
-                        .width(Length::Fill);
-                    let description = column![title, artists, album]
-                        .spacing(space.xxs)
-                        .width(LEFT_COLUMN_WIDTH);
+                container(scrollable(
+                    column(service.players().iter().map(|d| {
+                        const LEFT_COLUMN_WIDTH: Length = Length::FillPortion(3);
+                        const RIGHT_COLUMN_WIDTH: Length = Length::FillPortion(2);
+                        let m = d.metadata.as_ref();
+                        let title = m
+                            .and_then(|m| m.title.clone())
+                            .unwrap_or_else(|| t!("media-player-no-title"));
+                        let artists = m
+                            .and_then(|m| m.artists.clone())
+                            .map(|a| a.join(", "))
+                            .unwrap_or_else(|| t!("media-player-unknown-artist"));
+                        let album = m
+                            .and_then(|m| m.album.clone())
+                            .unwrap_or_else(|| t!("media-player-unknown-album"));
+                        let title = text(truncate_text(&title, self.config.max_text_length))
+                            .wrapping(text::Wrapping::WordOrGlyph)
+                            .width(Length::Fill);
+                        let artists = text(truncate_text(&artists, self.config.max_text_length))
+                            .wrapping(text::Wrapping::WordOrGlyph)
+                            .size(font_size.sm)
+                            .width(Length::Fill);
+                        let album = text(truncate_text(&album, self.config.max_text_length))
+                            .wrapping(text::Wrapping::WordOrGlyph)
+                            .size(font_size.sm)
+                            .width(Length::Fill);
+                        // Brings the player's window to the front; see `Message::Raise`.
+                        let raise_button = icon_button(StaticIcon::OpenWindow)
+                            .kind(ButtonKind::Transparent)
+                            .on_press(Message::Raise(d.service.clone()));
+                        let title = row![title, raise_button]
+                            .spacing(space.xs)
+                            .align_y(Vertical::Center);
+                        let description = column![title, artists, album]
+                            .spacing(space.xxs)
+                            .width(LEFT_COLUMN_WIDTH);
 
-                    let play_pause_icon = match d.state {
-                        PlaybackStatus::Playing => StaticIcon::Pause,
-                        PlaybackStatus::Paused | PlaybackStatus::Stopped => StaticIcon::Play,
-                    };
+                        let play_pause_icon = match d.state {
+                            PlaybackStatus::Playing => StaticIcon::Pause,
+                            PlaybackStatus::Paused | PlaybackStatus::Stopped => StaticIcon::Play,
+                        };
 
-                    let buttons = container(
-                        row![
-                            icon_button(StaticIcon::SkipPrevious)
-                                .on_press(Message::Prev(d.service.clone()))
-                                .size(ButtonSize::Large),
-                            icon_button(play_pause_icon)
-                                .on_press(Message::PlayPause(d.service.clone()))
-                                .size(ButtonSize::Large),
-                            icon_button(StaticIcon::SkipNext)
-                                .on_press(Message::Next(d.service.clone()))
-                                .size(ButtonSize::Large),
-                        ]
-                        .align_y(Vertical::Center)
-                        .spacing(space.xs),
-                    )
-                    .center_x(RIGHT_COLUMN_WIDTH);
-                    let volume_slider: Option<Element<'_, _>> = d.volume.map(|v| {
-                        slider(0.0..=100.0, v, move |v| {
-                            Message::SetVolume(d.service.clone(), v)
-                        })
-                        .width(LEFT_COLUMN_WIDTH)
-                        .into()
-                    });
-                    let cover: Option<Element<'_, _>> = d
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.art_url.as_ref())
-                        .map(|url| {
-                            let inner: Element<'_, _> = service
-                                .get_cover(url)
-                                .map(|handle| {
-                                    image(handle)
-                                        .filter_method(image::FilterMethod::Linear)
-                                        .into()
-                                })
-                                .unwrap_or_else(|| text(t!("media-player-loading-cover")).into());
-                            container(inner).center_x(RIGHT_COLUMN_WIDTH).into()
-                        });
-                    let metadata = |description, cover| -> Element<'_, _> {
-                        row![description]
-                            .push(cover)
-                            .spacing(space.md)
+                        let buttons = container(
+                            row![
+                                icon_button(StaticIcon::SkipPrevious)
+                                    .on_press(Message::Prev(d.service.clone()))
+                                    .size(ButtonSize::Large),
+                                icon_button(play_pause_icon)
+                                    .on_press(Message::PlayPause(d.service.clone()))
+                                    .size(ButtonSize::Large),
+                                icon_button(StaticIcon::SkipNext)
+                                    .on_press(Message::Next(d.service.clone()))
+                                    .size(ButtonSize::Large),
+                            ]
                             .align_y(Vertical::Center)
-                            .into()
-                    };
-                    let content: Element<'_, _> = match (volume_slider, cover) {
-                        (None, None) => row![description, buttons]
-                            .spacing(space.md)
-                            .align_y(Vertical::Center)
-                            .into(),
-                        (Some(v), cover) => {
-                            let controls =
-                                row![v, buttons].spacing(space.md).align_y(Vertical::Center);
-                            column![metadata(description, cover), controls]
+                            .spacing(space.xs),
+                        )
+                        .center_x(RIGHT_COLUMN_WIDTH);
+                        let volume_slider: Option<Element<'_, _>> =
+                            self.volume_of(&d.service).map(|v| {
+                                let service_name = d.service.clone();
+                                let s = slider(0.0..=100.0, v, remote_value::Message::Request)
+                                    .on_release(remote_value::Message::Timeout)
+                                    .width(LEFT_COLUMN_WIDTH)
+                                    .style(crate::theme::slider_style);
+                                Element::<'_, remote_value::Message<f64>>::from(s)
+                                    .map(move |m| Message::Volume(service_name.clone(), m))
+                            });
+                        let cover: Option<Element<'_, _>> = (!is_closing)
+                            .then(|| {
+                                d.metadata
+                                    .as_ref()
+                                    .and_then(|m| m.art_url.as_ref())
+                                    .map(|url| {
+                                        let inner: Element<'_, _> = service
+                                            .get_cover(url)
+                                            .map(|handle| {
+                                                image(handle)
+                                                    .filter_method(image::FilterMethod::Linear)
+                                                    .into()
+                                            })
+                                            .unwrap_or_else(|| {
+                                                text(t!("media-player-loading-cover")).into()
+                                            });
+                                        container(inner).center_x(RIGHT_COLUMN_WIDTH).into()
+                                    })
+                            })
+                            .flatten();
+                        let metadata = |description, cover| -> Element<'_, _> {
+                            row![description]
+                                .push(cover)
                                 .spacing(space.md)
+                                .align_y(Vertical::Center)
                                 .into()
-                        }
-                        (None, cover) => {
-                            let controls =
-                                row![space::horizontal().width(LEFT_COLUMN_WIDTH), buttons]
+                        };
+                        let content: Element<'_, _> = match (volume_slider, cover) {
+                            (None, None) => row![description, buttons]
+                                .spacing(space.md)
+                                .padding(space.md)
+                                .align_y(Vertical::Center)
+                                .into(),
+                            (Some(v), cover) => {
+                                let controls =
+                                    row![v, buttons].spacing(space.md).align_y(Vertical::Center);
+                                column![metadata(description, cover), controls]
                                     .spacing(space.md)
-                                    .align_y(Vertical::Center);
-                            column![metadata(description, cover), controls]
-                                .spacing(space.md)
+                                    .padding(space.md)
+                                    .into()
+                            }
+                            (None, cover) => {
+                                let controls =
+                                    row![space::horizontal().width(LEFT_COLUMN_WIDTH), buttons]
+                                        .spacing(space.md)
+                                        .align_y(Vertical::Center);
+                                column![metadata(description, cover), controls]
+                                    .spacing(space.md)
+                                    .padding(space.md)
+                                    .into()
+                            }
+                        };
+                        let card_playing = self.config.menu_visualizer
+                            && d.state == PlaybackStatus::Playing
+                            && !self.bars.is_empty()
+                            && !is_closing;
+                        let body: Element<'_, _> = if card_playing {
+                            Stack::new()
+                                .push(content)
+                                .push_under(
+                                    Canvas::new(VisualizerCanvas {
+                                        bars: self.bars.clone(),
+                                        low: palette.primary,
+                                        mid: palette.warning,
+                                        high: palette.danger,
+                                        opacity: 0.1,
+                                        radius: radius.lg,
+                                        min_bar_width: VISUALIZER_BAR_MIN_WIDTH,
+                                        max_bar_width: VISUALIZER_BG_BAR_MAX_WIDTH,
+                                        gap: VISUALIZER_BAR_GAP,
+                                        inset: 0.0,
+                                    })
+                                    .width(Length::Fill)
+                                    .height(Length::Fill),
+                                )
                                 .into()
-                        }
-                    };
-                    container(content)
-                        .style(move |app_theme: &Theme| container::Style {
-                            background: Background::Color(
-                                app_theme
-                                    .extended_palette()
-                                    .background
-                                    .weak
-                                    .color
-                                    .scale_alpha(opacity),
-                            )
-                            .into(),
-                            border: Border::default().rounded(radius.lg),
-                            ..container::Style::default()
-                        })
-                        .padding(space.md)
-                        .width(Length::Fill)
-                        .into()
-                }))
-                .spacing(space.md)
+                        } else {
+                            content
+                        };
+                        container(body)
+                            .style(crate::theme::card_style(radius.lg))
+                            .width(Length::Fill)
+                            .into()
+                    }))
+                    .spacing(space.md)
+                ))
+                .max_height(600)
             )
             .spacing(space.xs)
             .into(),
@@ -225,37 +525,277 @@ impl MediaPlayer {
         }
     }
 
-    fn get_title(&self, d: &MprisPlayerData) -> String {
-        match &d.metadata {
-            Some(m) => truncate_text(&m.to_string(), self.config.max_title_length),
-            None => t!("media-player-no-title"),
+    fn active_command(&mut self, command: PlayerCommand) -> Action {
+        match self.active_player().map(|p| p.service.clone()) {
+            Some(service) => Action::Command(self.handle_command(service, command)),
+            None => Action::None,
+        }
+    }
+
+    fn active_volume_command(&mut self, delta: f64) -> Action {
+        let Some(service_name) = self.active_player().map(|p| p.service.clone()) else {
+            return Action::None;
+        };
+        // Players that don't expose Volume over MPRIS have no cache entry and
+        // can't be adjusted at all.
+        let Some(current) = self.volume_of(&service_name) else {
+            return Action::None;
+        };
+        let new_volume = (current + delta).clamp(0.0, 100.0);
+        self.update(Message::Volume(
+            service_name,
+            remote_value::Message::RequestAndTimeout(new_volume),
+        ))
+    }
+
+    fn field_value(metadata: &MprisPlayerMetadata, field: MediaPlayerTextField) -> Option<String> {
+        match field {
+            MediaPlayerTextField::Artist => {
+                metadata.artists.as_ref().map(|artists| artists.join(", "))
+            }
+            MediaPlayerTextField::Title => metadata.title.clone(),
+            MediaPlayerTextField::Album => metadata.album.clone(),
+        }
+    }
+
+    fn format_metadata_fields(
+        metadata: Option<&MprisPlayerMetadata>,
+        fields: &[MediaPlayerTextField],
+    ) -> String {
+        let default_fields = [MediaPlayerTextField::Artist, MediaPlayerTextField::Title];
+        let fields = if fields.is_empty() {
+            &default_fields
+        } else {
+            fields
+        };
+
+        metadata.map_or_else(String::new, |metadata| {
+            fields
+                .iter()
+                .filter_map(|field| Self::field_value(metadata, *field))
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(" - ")
+        })
+    }
+
+    fn indicator_text(&self, d: &MprisPlayerData) -> String {
+        let value =
+            Self::format_metadata_fields(d.metadata.as_ref(), &self.config.indicator_fields);
+        if value.is_empty() {
+            t!("media-player-no-title")
+        } else {
+            truncate_text(&value, self.config.max_text_length)
         }
     }
 
     pub fn view(&'_ self) -> Option<Element<'_, Message>> {
-        let (space, font_size) = use_theme(|theme| (theme.space, theme.font_size));
-        self.service.as_ref().and_then(|s| {
-            s.players().first().map(|player| {
-                let title =
-                    (self.config.indicator_format == MediaPlayerFormat::IconAndTitle).then(|| {
-                        container(
-                            text(self.get_title(player))
-                                .wrapping(text::Wrapping::None)
-                                .size(font_size.sm),
-                        )
-                        .clip(true)
-                    });
+        let (space, font_size, palette) =
+            use_theme(|theme| (theme.space, theme.font_size, theme.palette));
+        self.active_player().map(|player| {
+            let has_text = self.config.indicator_format != MediaPlayerFormat::Icon;
+            let label = || {
+                container(
+                    text(self.indicator_text(player))
+                        .wrapping(text::Wrapping::None)
+                        .size(font_size.sm),
+                )
+                .clip(true)
+            };
 
-                row![icon(StaticIcon::MusicNote)]
-                    .push(title)
+            let content = match self.config.indicator_format {
+                MediaPlayerFormat::Icon => row![icon(StaticIcon::MusicNote)],
+                MediaPlayerFormat::Text => row![label()],
+                MediaPlayerFormat::IconAndText => row![icon(StaticIcon::MusicNote), label()],
+            }
+            .align_y(Vertical::Center)
+            .spacing(space.xs)
+            .height(Length::Fill);
+
+            let active = player.state == PlaybackStatus::Playing && !self.bars.is_empty();
+
+            let beside_visualizer = || {
+                container(
+                    Canvas::new(VisualizerCanvas {
+                        bars: self.bars.clone(),
+                        low: palette.primary,
+                        mid: palette.warning,
+                        high: palette.danger,
+                        opacity: 1.0,
+                        radius: 0.0,
+                        min_bar_width: VISUALIZER_BAR_MIN_WIDTH,
+                        max_bar_width: VISUALIZER_BESIDE_BAR_MAX_WIDTH,
+                        gap: VISUALIZER_BAR_GAP,
+                        inset: 0.0,
+                    })
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+                )
+                .width(Length::Fixed(VISUALIZER_BESIDE_WIDTH))
+                .padding(space.xxs)
+            };
+
+            match self.config.indicator_visualizer {
+                Some(MediaPlayerVisualizer::Background) if active => {
+                    let base: Element<'_, Message> = if has_text {
+                        content.into()
+                    } else {
+                        container(icon(StaticIcon::MusicNote))
+                            .center_x(Length::Fixed(VISUALIZER_BG_MIN_WIDTH))
+                            .center_y(Length::Fill)
+                            .into()
+                    };
+                    Stack::new()
+                        .push(base)
+                        .push_under(
+                            Canvas::new(VisualizerCanvas {
+                                bars: self.bars.clone(),
+                                low: palette.primary,
+                                mid: palette.warning,
+                                high: palette.danger,
+                                opacity: 0.1,
+                                radius: 0.0,
+                                min_bar_width: VISUALIZER_BAR_MIN_WIDTH,
+                                max_bar_width: VISUALIZER_BG_BAR_MAX_WIDTH,
+                                gap: VISUALIZER_BAR_GAP,
+                                inset: space.xxs,
+                            })
+                            .width(Length::Fill)
+                            .height(Length::Fill),
+                        )
+                        .into()
+                }
+                Some(MediaPlayerVisualizer::Before) if active => row![beside_visualizer(), content]
                     .align_y(Vertical::Center)
                     .spacing(space.xs)
-                    .into()
-            })
+                    .height(Length::Fill)
+                    .into(),
+                Some(MediaPlayerVisualizer::After) if active => row![content, beside_visualizer()]
+                    .align_y(Vertical::Center)
+                    .spacing(space.xs)
+                    .height(Length::Fill)
+                    .into(),
+                _ => content.into(),
+            }
         })
     }
 
-    pub fn subscription(&self) -> Subscription<Message> {
-        MprisPlayerService::subscribe().map(Message::Event)
+    pub fn subscription(&self, menu_open: bool) -> Subscription<Message> {
+        let cava = (self.visualizer_enabled(menu_open) && self.is_playing())
+            .then(|| self.cava_subscription().map(Message::Bars));
+        Subscription::batch(
+            [
+                Some(MprisPlayerService::subscribe().map(Message::Event)),
+                cava,
+            ]
+            .into_iter()
+            .flatten(),
+        )
     }
+
+    fn cava_subscription(&self) -> Subscription<Vec<f32>> {
+        struct Cava;
+
+        // The framerate is part of the subscription id so that a config reload
+        // restarts cava instead of leaving the old process at the old rate.
+        Subscription::run_with(
+            (TypeId::of::<Cava>(), self.config.visualizer_framerate),
+            |(_, framerate)| cava_stream(*framerate),
+        )
+    }
+}
+
+/// One cava process, decoded into normalized bar frames.
+fn cava_stream(framerate: u32) -> impl iced::futures::Stream<Item = Vec<f32>> {
+    channel(16, async move |mut output| {
+        let cava_config = format!(
+            "[general]\nbars = {VISUALIZER_BAR_COUNT}\nframerate = {framerate}\n\n\
+             [output]\nmethod = raw\nraw_target = /dev/stdout\ndata_format = ascii\nascii_max_range = 1000\n\n\
+             [smoothing]\nmonstercat = 1\n"
+        );
+
+        let config_path = match xdg::private_dir(true) {
+            Ok(dir) => dir.join("ashell_cava.cfg"),
+            Err(e) => {
+                log::error!("cava: failed to locate a private config directory: {e:#}");
+                return;
+            }
+        };
+        if let Err(e) = tokio::fs::write(&config_path, &cava_config).await {
+            log::error!("cava: failed to write config: {e}");
+            return;
+        }
+
+        let mut child = match tokio::process::Command::new("cava")
+            .arg("-p")
+            .arg(&config_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("cava: failed to spawn process: {e}");
+                return;
+            }
+        };
+
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                log::error!("cava: no stdout");
+                return;
+            }
+        };
+        let stderr = child.stderr.take();
+
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+
+        // cava emits at its configured framerate regardless of what the
+        // audio is doing, so silence and the tail of the monstercat
+        // decay produce long runs of identical frames. Every frame that
+        // reaches the runtime rebuilds `view()` and presents on *every*
+        // output, so drop the ones that cannot look any different.
+        let mut last_sent: Option<Vec<u8>> = None;
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let bars: Vec<f32> = line
+                .split(';')
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.trim().parse::<f32>().ok())
+                .map(|v| v / 1000.0)
+                .collect();
+
+            if bars.is_empty() {
+                continue;
+            }
+
+            let quantized: Vec<u8> = bars
+                .iter()
+                .map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8)
+                .collect();
+            if last_sent.as_ref() == Some(&quantized) {
+                continue;
+            }
+            last_sent = Some(quantized);
+
+            let _ = output.send(bars).await;
+        }
+
+        // stdout closed: cava exited on its own. Surface why, so a rejected
+        // config or an incompatible version is not a silent no-op.
+        if let Ok(status) = child.wait().await
+            && !status.success()
+        {
+            let mut err = String::new();
+            if let Some(mut stderr) = stderr {
+                use tokio::io::AsyncReadExt;
+                let _ = stderr.read_to_string(&mut err).await;
+            }
+            log::warn!("cava exited ({status}): {}", err.trim());
+        }
+    })
 }

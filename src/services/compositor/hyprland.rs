@@ -3,14 +3,15 @@ use super::types::{
     CompositorState, CompositorWorkspace,
 };
 use crate::services::{ServiceEvent, compositor::CompositorService};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use hyprland::{
-    data::{Client, Devices, Monitors, Workspace, Workspaces},
+    data::{Client, Clients, Devices, Monitors, Workspace, Workspaces},
     dispatch::{Dispatch, DispatchType, MonitorIdentifier, WorkspaceIdentifierWithSpecial},
     event_listener::AsyncEventListener,
     prelude::*,
 };
 use itertools::Itertools;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 
@@ -30,12 +31,17 @@ async fn is_lua_config() -> bool {
 
 /// Dispatch a command using the old hyprlang socket protocol.
 /// Works on all Hyprland versions but is broken on 0.55+ with Lua config.
-fn dispatch_hyprlang(cmd: CompositorCommand) -> Result<()> {
+async fn dispatch_hyprlang(cmd: CompositorCommand) -> Result<()> {
     match cmd {
         CompositorCommand::FocusWorkspace(id) => {
             Dispatch::call(DispatchType::Workspace(WorkspaceIdentifierWithSpecial::Id(
                 id,
             )))?;
+        }
+        CompositorCommand::FocusNamedWorkspace(name) => {
+            Dispatch::call(DispatchType::Workspace(
+                WorkspaceIdentifierWithSpecial::Name(name.as_str()),
+            ))?;
         }
         CompositorCommand::FocusSpecialWorkspace(name) => {
             Dispatch::call(DispatchType::Workspace(
@@ -56,12 +62,16 @@ fn dispatch_hyprlang(cmd: CompositorCommand) -> Result<()> {
         }
         CompositorCommand::NextLayout => {
             hyprland::ctl::switch_xkb_layout::call(
-                "all",
+                "main",
                 hyprland::ctl::switch_xkb_layout::SwitchXKBLayoutCmdTypes::Next,
             )?;
         }
         CompositorCommand::CustomDispatch(dispatcher, args) => {
             Dispatch::call(DispatchType::Custom(&dispatcher, &args))?;
+        }
+        CompositorCommand::FocusAppWindow { pid, apps, title } => {
+            let selector = app_window_selector(pid, &apps, title.as_deref()).await?;
+            Dispatch::call(DispatchType::Custom("focuswindow", &selector))?;
         }
     }
     Ok(())
@@ -74,10 +84,16 @@ async fn dispatch_lua(cmd: CompositorCommand) -> Result<()> {
         CompositorCommand::FocusWorkspace(id) => {
             format!("hl.dispatch(hl.dsp.focus({{ workspace = {id} }}))")
         }
+        CompositorCommand::FocusNamedWorkspace(name) => {
+            let name = escape_lua_string(&name);
+            format!("hl.dispatch(hl.dsp.focus({{ workspace = \"name:{name}\" }}))")
+        }
         CompositorCommand::FocusSpecialWorkspace(name) => {
+            let name = escape_lua_string(&name);
             format!("hl.dispatch(hl.dsp.focus({{ workspace = \"special:{name}\" }}))")
         }
         CompositorCommand::ToggleSpecialWorkspace(name) => {
+            let name = escape_lua_string(&name);
             format!("hl.dispatch(hl.dsp.workspace.toggle_special(\"{name}\"))")
         }
         CompositorCommand::FocusMonitor(id) => {
@@ -89,13 +105,23 @@ async fn dispatch_lua(cmd: CompositorCommand) -> Result<()> {
         }
         CompositorCommand::NextLayout => {
             hyprland::ctl::switch_xkb_layout::call(
-                "all",
+                "main",
                 hyprland::ctl::switch_xkb_layout::SwitchXKBLayoutCmdTypes::Next,
             )?;
             return Ok(());
         }
         CompositorCommand::CustomDispatch(dispatcher, args) => {
+            // `dispatcher` is a Lua identifier and `args` is spliced in as a raw
+            // Lua expression (e.g. `{ workspace = "3" }`), not a string literal —
+            // escaping either would break valid input. The contract here is that
+            // the caller hands us Lua.
             format!("hl.dispatch(hl.dsp.{dispatcher}({args}))")
+        }
+        CompositorCommand::FocusAppWindow { pid, apps, title } => {
+            format!(
+                "hl.dispatch(hl.dsp.focus({{ window = \"{}\" }}))",
+                app_window_selector(pid, &apps, title.as_deref()).await?
+            )
         }
     };
     tokio::process::Command::new("hyprctl")
@@ -105,12 +131,67 @@ async fn dispatch_lua(cmd: CompositorCommand) -> Result<()> {
     Ok(())
 }
 
+async fn app_window_selector(
+    pid: Option<u32>,
+    apps: &[String],
+    title: Option<&str>,
+) -> Result<String> {
+    let clients = Clients::get_async().await?;
+
+    // Sandboxed apps can report another pid, so fall back to the window class
+    // when no window has the player's pid.
+    let by_pid: Vec<_> = clients
+        .iter()
+        .filter(|c| pid.is_some_and(|pid| u32::try_from(c.pid).is_ok_and(|p| p == pid)))
+        .collect();
+    let candidates = if by_pid.is_empty() {
+        clients
+            .iter()
+            .filter(|c| {
+                super::app_matches(Some(&c.class), apps)
+                    || super::app_matches(Some(&c.initial_class), apps)
+            })
+            .collect()
+    } else {
+        by_pid
+    };
+
+    // Prefer the window whose title shows the media, then the most recently
+    // focused (0 is the current one); a negative id, if any, means never
+    // focused and sorts last.
+    candidates
+        .into_iter()
+        .max_by_key(|c| {
+            (
+                super::title_matches(Some(&c.title), title),
+                (c.focus_history_id >= 0).then(|| -i16::from(c.focus_history_id)),
+            )
+        })
+        .map(|c| format!("address:{}", c.address))
+        .ok_or_else(|| anyhow!("No window found for pid {pid:?} or apps {apps:?}"))
+}
+
 pub async fn execute_command(cmd: CompositorCommand) -> Result<()> {
     if is_lua_config().await {
         dispatch_lua(cmd).await
     } else {
-        dispatch_hyprlang(cmd)
+        dispatch_hyprlang(cmd).await
     }
+}
+
+// Names reach the Lua layer by string interpolation, so quotes, backslashes
+// and control characters must be escaped or a workspace name containing them
+// breaks the generated program.
+// TODO: switch to `hyprland::lua::{quote_string, escape_string}` once
+// hyprland-rs#399 lands, since it also covers the remaining control
+// characters as zero-padded \ddd sequences.
+fn escape_lua_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -205,19 +286,48 @@ pub async fn run_listener(tx: &broadcast::Sender<ServiceEvent<CompositorService>
         .map_err(|e| anyhow::anyhow!(e))
 }
 
+const SPECIAL_WORKSPACE_ID_START: i32 = -99;
+const SPECIAL_WORKSPACE_ID_END: i32 = -2;
+
+/// Mirrors Hyprland's `CWorkspaceQueryCore::isSpecial`. Named workspaces are
+/// negative too (from -1337 down), so `id < 0` is not enough.
+fn is_special_workspace_id(id: i32) -> bool {
+    (SPECIAL_WORKSPACE_ID_START..=SPECIAL_WORKSPACE_ID_END).contains(&id)
+}
+
 fn fetch_full_state(internal_state: &HyprInternalState) -> Result<CompositorState> {
+    let collect_classes = super::should_collect_window_classes();
+
+    let mut workspace_classes: HashMap<i32, Vec<String>> = HashMap::new();
+    if collect_classes {
+        for client in Clients::get()? {
+            workspace_classes
+                .entry(client.workspace.id)
+                .or_default()
+                .push(client.class);
+        }
+    }
+
     let workspaces = Workspaces::get()?
         .into_iter()
         .sorted_by_key(|w| w.id)
-        .map(|w| CompositorWorkspace {
-            id: w.id,
-            index: w.id,
-            name: w.name,
-            monitor: w.monitor,
-            monitor_id: w.monitor_id,
-            windows: w.windows,
-            is_special: w.id < 0,
-            has_urgent: false,
+        .map(|w| {
+            let window_classes = if collect_classes {
+                workspace_classes.remove(&w.id).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            CompositorWorkspace {
+                id: w.id,
+                index: w.id,
+                name: w.name,
+                monitor: w.monitor,
+                monitor_id: w.monitor_id,
+                windows: w.windows,
+                is_special: is_special_workspace_id(w.id),
+                has_urgent: false,
+                window_classes,
+            }
         })
         .collect();
 
@@ -231,7 +341,11 @@ fn fetch_full_state(internal_state: &HyprInternalState) -> Result<CompositorStat
         })
         .collect();
 
-    let active_workspace_id = Workspace::get_active().ok().map(|w| w.id);
+    let active_workspace_ids = Workspace::get_active()
+        .ok()
+        .map(|w| w.id)
+        .into_iter()
+        .collect();
 
     let active_window = Client::get_active().ok().flatten().map(|w| {
         ActiveWindow::Hyprland(ActiveWindowHyprland {
@@ -256,7 +370,7 @@ fn fetch_full_state(internal_state: &HyprInternalState) -> Result<CompositorStat
     Ok(CompositorState {
         workspaces,
         monitors,
-        active_workspace_id,
+        active_workspace_ids,
         active_window,
         keyboard_layout,
         submap: if internal_state.submap.is_empty() {
@@ -265,4 +379,45 @@ fn fetch_full_state(internal_state: &HyprInternalState) -> Result<CompositorStat
             Some(internal_state.submap.clone())
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{escape_lua_string, is_special_workspace_id};
+
+    #[test]
+    fn quotes_and_backslashes_are_escaped() {
+        assert_eq!(escape_lua_string(r#"a\b"c"#), r#"a\\b\"c"#);
+    }
+
+    #[test]
+    fn control_characters_are_escaped() {
+        assert_eq!(escape_lua_string("a\nb\rc\td"), r"a\nb\rc\td");
+    }
+
+    #[test]
+    fn plain_names_are_untouched() {
+        assert_eq!(escape_lua_string("special:2"), "special:2");
+    }
+
+    #[test]
+    fn special_workspace_ids_are_special() {
+        for id in [-99, -50, -3, -2] {
+            assert!(is_special_workspace_id(id), "{id} should be special");
+        }
+    }
+
+    #[test]
+    fn named_workspace_ids_are_not_special() {
+        for id in [-1, -100, -1337, -1338, -2000] {
+            assert!(!is_special_workspace_id(id), "{id} should not be special");
+        }
+    }
+
+    #[test]
+    fn numbered_workspace_ids_are_not_special() {
+        for id in [0, 1, 10] {
+            assert!(!is_special_workspace_id(id), "{id} should not be special");
+        }
+    }
 }

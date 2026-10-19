@@ -1,9 +1,9 @@
+use super::xdg_icons;
 use super::{ReadOnlyService, Service, ServiceEvent};
 use dbus::{
     DBusMenuProxy, Layout, StatusNotifierItemProxy, StatusNotifierWatcher,
     StatusNotifierWatcherProxy,
 };
-use freedesktop_icons::lookup;
 use iced::{
     Subscription, Task,
     futures::{
@@ -13,259 +13,14 @@ use iced::{
         stream_select,
     },
     stream::channel,
-    widget::{image, svg},
+    widget::image,
 };
-use linicon_theme::get_icon_theme;
 use log::{debug, error, info, trace};
-use std::{
-    any::TypeId,
-    borrow::Cow,
-    collections::BTreeSet,
-    env,
-    ffi::OsString,
-    fs,
-    ops::Deref,
-    path::{Path, PathBuf},
-    sync::LazyLock,
-};
+use std::{any::TypeId, ops::Deref};
 
 pub mod dbus;
 
-static SYSTEM_ICON_NAMES: LazyLock<BTreeSet<OsString>> = LazyLock::new(load_system_icon_names);
-static SYSTEM_ICON_ENTRIES: LazyLock<Vec<(Cow<'static, str>, Cow<'static, str>)>> =
-    LazyLock::new(|| {
-        let capacity = SYSTEM_ICON_NAMES.len();
-        let mut entries = Vec::with_capacity(capacity);
-        for name in SYSTEM_ICON_NAMES.iter() {
-            if let Some(name_str) = name.to_str() {
-                let normalized = normalize_icon_name(name_str);
-                let normalized_cow = if normalized.as_ref() == name_str {
-                    Cow::Borrowed(name_str)
-                } else {
-                    match normalized {
-                        Cow::Borrowed(s) => Cow::Owned(s.to_string()),
-                        Cow::Owned(s) => Cow::Owned(s),
-                    }
-                };
-                entries.push((Cow::Owned(name_str.to_string()), normalized_cow));
-            }
-        }
-        entries
-    });
-
-fn get_icon_from_name(icon_name: &str) -> Option<TrayIcon> {
-    let icon_name = icon_name.trim();
-    if icon_name.is_empty() {
-        return None;
-    }
-
-    if let Some(path) = find_icon_path(icon_name) {
-        return tray_icon_from_path(path);
-    }
-
-    if let Some(candidates) = similar_icon_names(icon_name) {
-        for candidate in candidates {
-            if let Some(path) = find_icon_path(&candidate) {
-                return tray_icon_from_path(path);
-            }
-        }
-    }
-
-    if let Some(prefix_candidate) = prefix_match_icon(icon_name)
-        && let Some(path) = find_icon_path(&prefix_candidate)
-    {
-        return tray_icon_from_path(path);
-    }
-
-    None
-}
-
-fn tray_icon_from_path(path: PathBuf) -> Option<TrayIcon> {
-    if path.extension().is_some_and(|ext| ext == "svg") {
-        debug!("svg icon found. Path: {path:?}");
-
-        Some(TrayIcon::Svg(svg::Handle::from_path(path)))
-    } else {
-        debug!("raster icon found. Path: {path:?}");
-
-        Some(TrayIcon::Image(image::Handle::from_path(path)))
-    }
-}
-
-fn find_icon_path(icon_name: &str) -> Option<PathBuf> {
-    let base_lookup = lookup(icon_name).with_cache();
-
-    match get_icon_theme() {
-        Some(theme) => base_lookup.with_theme(&theme).find().or_else(|| {
-            let fallback_lookup = lookup(icon_name).with_cache();
-            fallback_lookup.find()
-        }),
-        None => base_lookup.find(),
-    }
-}
-
-fn similar_icon_names(icon_name: &str) -> Option<Vec<Cow<'static, str>>> {
-    if SYSTEM_ICON_ENTRIES.is_empty() {
-        return None;
-    }
-
-    let normalized = normalize_icon_name(icon_name);
-    let normalized_no_separators = strip_icon_separators(normalized.as_ref());
-    let mut matches: Vec<Cow<'static, str>> = Vec::with_capacity(5);
-
-    for (candidate_name, candidate_normalized) in SYSTEM_ICON_ENTRIES.iter() {
-        if candidate_normalized.as_ref() == normalized.as_ref() {
-            continue;
-        }
-
-        if candidate_normalized.as_ref().contains(normalized.as_ref())
-            || normalized.as_ref().contains(candidate_normalized.as_ref())
-            || candidate_normalized
-                .as_ref()
-                .contains(normalized_no_separators.as_ref())
-        {
-            matches.push(Cow::Borrowed(candidate_name.as_ref()));
-            if matches.len() >= 5 {
-                break;
-            }
-        }
-    }
-
-    if matches.is_empty() {
-        None
-    } else {
-        Some(matches)
-    }
-}
-
-fn normalize_icon_name(name: &str) -> Cow<'_, str> {
-    // Fast path: if name is already normalized (only lowercase alphanumeric, no separators)
-    if name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-    {
-        return Cow::Borrowed(name);
-    }
-
-    // Slow path: normalize the name (lowercase and strip non-alphanumeric characters including separators)
-    Cow::Owned(
-        name.to_lowercase()
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .collect(),
-    )
-}
-
-fn strip_icon_separators(name: &str) -> Cow<'_, str> {
-    if name.bytes().all(|byte| byte != b'-' && byte != b'_') {
-        return Cow::Borrowed(name);
-    }
-
-    Cow::Owned(name.chars().filter(|ch| *ch != '-' && *ch != '_').collect())
-}
-
-fn prefix_match_icon(icon_name: &str) -> Option<Cow<'static, str>> {
-    if SYSTEM_ICON_ENTRIES.is_empty() {
-        return None;
-    }
-
-    let normalized = normalize_icon_name(icon_name);
-
-    // Early exit: check for exact match first
-    if let Some(exact) = SYSTEM_ICON_ENTRIES
-        .iter()
-        .find(|(_, norm)| norm.as_ref() == normalized.as_ref())
-    {
-        return Some(Cow::Borrowed(exact.0.as_ref()));
-    }
-
-    // Iterate directly over chars to avoid Vec allocation
-    let mut candidates: Vec<_> = SYSTEM_ICON_ENTRIES.iter().collect();
-    for (idx, ch) in normalized.chars().enumerate() {
-        candidates.retain(|(_, name)| name.chars().nth(idx) == Some(ch));
-
-        match candidates.len() {
-            0 => break,
-            1 => return Some(Cow::Borrowed(candidates[0].0.as_ref())),
-            _ => continue,
-        }
-    }
-
-    candidates
-        .first()
-        .map(|(name, _)| Cow::Borrowed(name.as_ref()))
-}
-
-fn load_system_icon_names() -> BTreeSet<OsString> {
-    let mut names = BTreeSet::new();
-
-    for dir in icon_directories() {
-        if !dir.is_dir() {
-            continue;
-        }
-
-        collect_icon_names_recursive(&dir, &mut names);
-    }
-
-    names
-}
-
-fn collect_icon_names_recursive(dir: &Path, names: &mut BTreeSet<OsString>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(file_type) = entry.file_type() {
-                if file_type.is_dir() {
-                    collect_icon_names_recursive(&path, names);
-                } else if file_type.is_file()
-                    && let Some(stem) = path.file_stem()
-                {
-                    names.insert(stem.to_os_string());
-                }
-            }
-        }
-    }
-}
-
-fn icon_directories() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    if let Ok(data_home) = env::var("XDG_DATA_HOME") {
-        let base = PathBuf::from(data_home);
-        dirs.push(base.join("icons"));
-        dirs.push(base.join("pixmaps"));
-    }
-
-    if let Ok(home) = env::var("HOME") {
-        let base = PathBuf::from(home);
-        dirs.push(base.join(".local/share/icons"));
-        dirs.push(base.join(".local/share/pixmaps"));
-    }
-
-    let data_dirs =
-        env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
-    for dir in data_dirs.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let base = PathBuf::from(dir);
-        dirs.push(base.join("icons"));
-        dirs.push(base.join("pixmaps"));
-    }
-
-    dirs.push(PathBuf::from("/usr/share/icons"));
-    dirs.push(PathBuf::from("/usr/share/pixmaps"));
-
-    dirs.sort();
-    dirs.dedup();
-    dirs
-}
-
-#[derive(Debug, Clone)]
-pub enum TrayIcon {
-    Image(image::Handle),
-    Svg(svg::Handle),
-}
+pub type TrayIcon = super::xdg_icons::XdgIcon;
 
 fn pixmap_to_icon(icons: Vec<dbus::Icon>) -> Option<TrayIcon> {
     icons
@@ -305,7 +60,7 @@ fn pixmap_to_icon(icons: Vec<dbus::Icon>) -> Option<TrayIcon> {
         })
         .map(|mut i| {
             // Convert ARGB to RGBA
-            for pixel in i.bytes.chunks_exact_mut(4) {
+            for pixel in i.bytes.as_chunks_mut::<4>().0 {
                 pixel.rotate_left(1);
             }
             TrayIcon::Image(image::Handle::from_rgba(
@@ -316,13 +71,66 @@ fn pixmap_to_icon(icons: Vec<dbus::Icon>) -> Option<TrayIcon> {
         })
 }
 
+async fn current_icon_from_proxy(item_proxy: &StatusNotifierItemProxy<'_>) -> Option<TrayIcon> {
+    if let Ok(icons) = item_proxy.icon_pixmap().await
+        && let Some(icon) = pixmap_to_icon(icons)
+    {
+        return Some(icon);
+    }
+    if let Some(name) = item_proxy.icon_name().await.ok()
+        && !name.is_empty()
+        && let Some(icon) = xdg_icons::get_icon_from_name(&name)
+    {
+        return Some(icon);
+    }
+    None
+}
+
+async fn current_attention_icon_from_proxy(
+    item_proxy: &StatusNotifierItemProxy<'_>,
+) -> Option<TrayIcon> {
+    if let Ok(icons) = item_proxy.attention_icon_pixmap().await
+        && let Some(icon) = pixmap_to_icon(icons)
+    {
+        return Some(icon);
+    }
+    if let Some(name) = item_proxy.attention_icon_name().await.ok()
+        && !name.is_empty()
+        && let Some(icon) = xdg_icons::get_icon_from_name(&name)
+    {
+        return Some(icon);
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub enum TrayEvent {
-    Registered(StatusNotifierItem),
+    Registered(Box<StatusNotifierItem>),
     IconChanged(String, TrayIcon),
+    AttentionIconChanged(String, TrayIcon),
     MenuLayoutChanged(String, Layout),
+    StatusChanged(String, String),
     Unregistered(String),
     None,
+}
+
+/// SNI `Status` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ItemStatus {
+    #[default]
+    Passive,
+    Active,
+    NeedsAttention,
+}
+
+impl From<&str> for ItemStatus {
+    fn from(s: &str) -> Self {
+        match s {
+            "Active" => Self::Active,
+            "NeedsAttention" => Self::NeedsAttention,
+            _ => Self::Passive,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -330,18 +138,19 @@ pub struct StatusNotifierItem {
     pub name: String,
     pub icon: Option<TrayIcon>,
     pub menu: Layout,
+    pub status: ItemStatus,
+    pub attention_icon: Option<TrayIcon>,
     item_proxy: StatusNotifierItemProxy<'static>,
     menu_proxy: DBusMenuProxy<'static>,
 }
 
 impl StatusNotifierItem {
     pub async fn new(conn: &zbus::Connection, name: String) -> anyhow::Result<Self> {
-        let (dest, path) = if let Some(idx) = name.find('/') {
-            (&name[..idx], &name[idx..])
-        } else {
-            (name.as_ref(), "/StatusNotifierItem")
-        };
+        let (dest, path) = dbus::split_service_name(&name);
 
+        // Keep property caching enabled: `receive_icon_name_changed` and
+        // `receive_icon_pixmap_changed` are `PropertyStream`s and yield
+        // nothing when the proxy has no property cache.
         let item_proxy = StatusNotifierItemProxy::builder(conn)
             .destination(dest.to_owned())?
             .path(path.to_owned())?
@@ -350,15 +159,17 @@ impl StatusNotifierItem {
 
         debug!("item_proxy {item_proxy:?}");
 
-        let icon = match item_proxy.icon_pixmap().await.ok().and_then(pixmap_to_icon) {
-            Some(icon) => Some(icon),
-            None => item_proxy
-                .icon_name()
-                .await
-                .ok()
-                .as_deref()
-                .and_then(get_icon_from_name),
-        };
+        let icon = current_icon_from_proxy(&item_proxy).await;
+
+        // A failed `Status` read means the client skips the property, not
+        // that it is passive; only an explicit `Passive` hides an item.
+        let status_str = item_proxy
+            .status()
+            .await
+            .unwrap_or_else(|_| "Active".to_owned());
+        let status = ItemStatus::from(status_str.as_str());
+
+        let attention_icon = current_attention_icon_from_proxy(&item_proxy).await;
 
         let menu_path = item_proxy.menu().await?;
         let menu_proxy = dbus::DBusMenuProxy::builder(conn)
@@ -373,6 +184,8 @@ impl StatusNotifierItem {
             name,
             icon,
             menu,
+            status,
+            attention_icon,
             item_proxy,
             menu_proxy,
         })
@@ -444,7 +257,7 @@ impl TrayService {
                                 let item =
                                     StatusNotifierItem::new(&conn, args.service.to_string()).await;
 
-                                item.map(TrayEvent::Registered).ok()
+                                item.map(|item| TrayEvent::Registered(Box::new(item))).ok()
                             }
                             _ => None,
                         }
@@ -468,7 +281,10 @@ impl TrayService {
         let items = watcher.registered_status_notifier_items().await?;
         let mut icon_pixel_change = Vec::with_capacity(items.len());
         let mut icon_name_change = Vec::with_capacity(items.len());
+        let mut new_icon_change = Vec::with_capacity(items.len());
+        let mut attention_icon_change = Vec::with_capacity(items.len());
         let mut menu_layout_change = Vec::with_capacity(items.len());
+        let mut status_change = Vec::with_capacity(items.len());
 
         for name in items {
             let item = StatusNotifierItem::new(conn, name.to_string()).await?;
@@ -505,13 +321,96 @@ impl TrayService {
                                     .await
                                     .ok()
                                     .as_deref()
-                                    .and_then(get_icon_from_name)
+                                    .and_then(xdg_icons::get_icon_from_name)
                                     .map(|icon| TrayEvent::IconChanged(name.to_owned(), icon))
                             }
                         }
                     })
                     .boxed(),
             );
+
+            let new_status = item.item_proxy.receive_new_status().await;
+            if let Ok(new_status) = new_status {
+                status_change.push(
+                    new_status
+                        .filter_map({
+                            let name = name.clone();
+                            move |signal| {
+                                let name = name.clone();
+                                async move {
+                                    let status = signal.args().ok()?.status.to_owned();
+                                    Some(TrayEvent::StatusChanged(name, status))
+                                }
+                            }
+                        })
+                        .boxed(),
+                );
+            }
+
+            let new_icon = item.item_proxy.receive_new_icon().await;
+            if let Ok(new_icon) = new_icon {
+                let (dest, path) = dbus::split_service_name(&name);
+                // NewIcon has no matching PropertiesChanged, so a cached read would be stale;
+                let uncached_proxy = StatusNotifierItemProxy::builder(conn)
+                    .destination(dest.to_owned())?
+                    .path(path.to_owned())?
+                    .cache_properties(zbus::proxy::CacheProperties::No)
+                    .build()
+                    .await?;
+
+                new_icon_change.push(
+                    new_icon
+                        .filter_map({
+                            let name = name.clone();
+                            let uncached_proxy = uncached_proxy;
+
+                            move |_| {
+                                let name = name.clone();
+                                let uncached_proxy = uncached_proxy.clone();
+
+                                async move {
+                                    current_icon_from_proxy(&uncached_proxy)
+                                        .await
+                                        .map(|icon| TrayEvent::IconChanged(name.to_owned(), icon))
+                                }
+                            }
+                        })
+                        .boxed(),
+                );
+            }
+
+            let new_attention_icon = item.item_proxy.receive_new_attention_icon().await;
+            if let Ok(new_attention_icon) = new_attention_icon {
+                let (dest, path) = dbus::split_service_name(&name);
+                let uncached_proxy = StatusNotifierItemProxy::builder(conn)
+                    .destination(dest.to_owned())?
+                    .path(path.to_owned())?
+                    .cache_properties(zbus::proxy::CacheProperties::No)
+                    .build()
+                    .await?;
+
+                attention_icon_change.push(
+                    new_attention_icon
+                        .filter_map({
+                            let name = name.clone();
+                            let uncached_proxy = uncached_proxy;
+
+                            move |_| {
+                                let name = name.clone();
+                                let uncached_proxy = uncached_proxy.clone();
+
+                                async move {
+                                    current_attention_icon_from_proxy(&uncached_proxy)
+                                        .await
+                                        .map(|icon| {
+                                            TrayEvent::AttentionIconChanged(name.to_owned(), icon)
+                                        })
+                                }
+                            }
+                        })
+                        .boxed(),
+                );
+            }
 
             let layout_updated = item.menu_proxy.receive_layout_updated().await;
             if let Ok(layout_updated) = layout_updated {
@@ -537,6 +436,31 @@ impl TrayService {
                         .boxed(),
                 );
             }
+
+            let items_removed = item.menu_proxy.receive_items_removed().await;
+            if let Ok(items_removed) = items_removed {
+                menu_layout_change.push(
+                    items_removed
+                        .filter_map({
+                            let name = name.clone();
+                            let menu_proxy = item.menu_proxy.clone();
+                            move |_| {
+                                debug!("items removed event name {}", name);
+
+                                let name = name.clone();
+                                let menu_proxy = menu_proxy.clone();
+                                async move {
+                                    menu_proxy.get_layout(0, -1, &[]).await.ok().map(
+                                        |(_, layout)| {
+                                            TrayEvent::MenuLayoutChanged(name.to_owned(), layout)
+                                        },
+                                    )
+                                }
+                            }
+                        })
+                        .boxed(),
+                );
+            }
         }
 
         Ok(stream_select!(
@@ -544,7 +468,10 @@ impl TrayService {
             unregistered,
             select_all(icon_pixel_change),
             select_all(icon_name_change),
-            select_all(menu_layout_change)
+            select_all(new_icon_change),
+            select_all(attention_icon_change),
+            select_all(menu_layout_change),
+            select_all(status_change)
         )
         .boxed())
     }
@@ -589,6 +516,9 @@ impl TrayService {
                         while let Some(event) = events.next().await {
                             debug!("tray data {event:?}");
 
+                            // Subscriptions are built only for items present at
+                            // stream creation, so rebuild the stream when a new
+                            // item registers.
                             let reload_events = matches!(event, TrayEvent::Registered(_));
 
                             let _ = output.send(ServiceEvent::Update(event)).await;
@@ -642,6 +572,8 @@ impl ReadOnlyService for TrayService {
     fn update(&mut self, event: Self::UpdateEvent) {
         match event {
             TrayEvent::Registered(new_item) => {
+                let new_item = *new_item;
+                // Replace by name as a defensive fallback, otherwise append.
                 match self
                     .data
                     .0
@@ -661,10 +593,20 @@ impl ReadOnlyService for TrayService {
                     item.icon = Some(handle);
                 }
             }
+            TrayEvent::AttentionIconChanged(name, handle) => {
+                if let Some(item) = self.data.0.iter_mut().find(|item| item.name == name) {
+                    item.attention_icon = Some(handle);
+                }
+            }
             TrayEvent::MenuLayoutChanged(name, layout) => {
                 if let Some(item) = self.data.0.iter_mut().find(|item| item.name == name) {
                     debug!("menu layout updated, {layout:?}");
                     item.menu = layout;
+                }
+            }
+            TrayEvent::StatusChanged(name, status) => {
+                if let Some(item) = self.data.0.iter_mut().find(|item| item.name == name) {
+                    item.status = ItemStatus::from(status.as_str());
                 }
             }
             TrayEvent::Unregistered(name) => {
@@ -741,5 +683,86 @@ impl Service for TrayService {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ItemStatus, pixmap_to_icon};
+    use crate::services::tray::dbus::Icon;
+
+    fn valid_pixmap(width: i32, height: i32) -> Icon {
+        Icon {
+            width,
+            height,
+            bytes: vec![0u8; (width as usize) * (height as usize) * 4],
+        }
+    }
+
+    #[test]
+    fn item_status_parses_active() {
+        assert_eq!(ItemStatus::from("Active"), ItemStatus::Active);
+    }
+
+    #[test]
+    fn item_status_parses_needs_attention() {
+        assert_eq!(
+            ItemStatus::from("NeedsAttention"),
+            ItemStatus::NeedsAttention
+        );
+    }
+
+    #[test]
+    fn item_status_defaults_passive_for_unknown_and_empty() {
+        assert_eq!(ItemStatus::from("Passive"), ItemStatus::Passive);
+        assert_eq!(ItemStatus::from(""), ItemStatus::Passive);
+        assert_eq!(ItemStatus::from("garbage"), ItemStatus::Passive);
+    }
+
+    #[test]
+    fn item_status_default_is_passive() {
+        assert_eq!(ItemStatus::default(), ItemStatus::Passive);
+    }
+
+    #[test]
+    fn pixmap_to_icon_accepts_valid_pixmap() {
+        let icon = valid_pixmap(24, 24);
+        let result = pixmap_to_icon(vec![icon]);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn pixmap_to_icon_rejects_zero_dimension_pixmap() {
+        let icon = Icon {
+            width: 0,
+            height: 24,
+            bytes: vec![],
+        };
+        assert!(pixmap_to_icon(vec![icon]).is_none());
+    }
+
+    #[test]
+    fn pixmap_to_icon_rejects_byte_mismatch() {
+        let icon = Icon {
+            width: 24,
+            height: 24,
+            bytes: vec![0u8; 100],
+        };
+        assert!(pixmap_to_icon(vec![icon]).is_none());
+    }
+
+    #[test]
+    fn pixmap_to_icon_picks_largest_pixmap() {
+        let small = valid_pixmap(16, 16);
+        let large = valid_pixmap(48, 48);
+
+        let result = pixmap_to_icon(vec![small, large]).expect("expected an icon");
+
+        assert!(matches!(result, crate::services::tray::TrayIcon::Image(_)));
+    }
+
+    #[test]
+    fn pixmap_to_icon_returns_none_for_empty_vec() {
+        assert!(pixmap_to_icon(Vec::new()).is_none());
     }
 }

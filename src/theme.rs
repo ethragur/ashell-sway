@@ -3,15 +3,18 @@ use std::cell::RefCell;
 use crate::{
     components::button::{ButtonHierarchy, ButtonKind},
     config::{
-        Appearance, AppearanceColor, AppearanceStyle, BackgroundLevel, MenuAppearance, Position,
+        Appearance, AppearanceColor, BackgroundLevel, BarAppearance, BarMargin, BarPadding,
+        BarRadius, BarSurface, MenuAppearance, Position, RadiusSize, SpaceSize, Surface,
     },
 };
 use iced::{
-    Background, Border, Color, Theme,
+    Background, Border, Color, Shadow, Theme, Vector, border,
     theme::{Palette, palette},
     widget::{
         button::{self, Status},
+        container, progress_bar, rule, scrollable, slider,
         text_input::{self},
+        toggler,
     },
 };
 
@@ -53,6 +56,21 @@ impl Default for Space {
     }
 }
 
+impl Space {
+    pub fn resolve(&self, size: SpaceSize) -> f32 {
+        match size {
+            SpaceSize::None => 0.0,
+            SpaceSize::Xxs => self.xxs,
+            SpaceSize::Xs => self.xs,
+            SpaceSize::Sm => self.sm,
+            SpaceSize::Md => self.md,
+            SpaceSize::Lg => self.lg,
+            SpaceSize::Xl => self.xl,
+            SpaceSize::Xxl => self.xxl,
+        }
+    }
+}
+
 #[allow(unused)]
 #[derive(Debug, Clone, Copy)]
 pub struct Radius {
@@ -70,6 +88,58 @@ impl Default for Radius {
             lg: 16.0,
             xl: 32.0,
         }
+    }
+}
+
+impl Radius {
+    pub fn resolve(&self, size: RadiusSize) -> f32 {
+        match size {
+            RadiusSize::None => 0.0,
+            RadiusSize::Sm => self.sm,
+            RadiusSize::Md => self.md,
+            RadiusSize::Lg => self.lg,
+            RadiusSize::Xl => self.xl,
+        }
+    }
+}
+
+/// Bar geometry the layer-surface layer needs: which surface mode drives the
+/// bar height, plus the resolved outer margin in logical (unscaled) pixels
+/// ordered `(top, right, bottom, left)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BarLayout {
+    pub surface: BarSurface,
+    pub margin: BarMargin,
+    pub padding: BarPadding,
+}
+
+impl BarLayout {
+    pub fn from_appearance(bar: &BarAppearance) -> Self {
+        Self::new(bar.surface, bar.margin, bar.padding)
+    }
+
+    fn new(surface: BarSurface, margin: BarMargin, padding: BarPadding) -> Self {
+        Self {
+            surface,
+            margin,
+            padding,
+        }
+    }
+
+    /// Padding resolved to logical pixels, as iced renders it.
+    pub fn padding(&self) -> iced::Padding {
+        iced::Padding {
+            top: self.padding.top.into(),
+            right: self.padding.right.into(),
+            bottom: self.padding.bottom.into(),
+            left: self.padding.left.into(),
+        }
+    }
+
+    /// Extra surface height the padding needs on top of the content height.
+    pub fn vertical_padding(&self) -> f64 {
+        let p = self.padding();
+        f64::from(p.top + p.bottom)
     }
 }
 
@@ -99,21 +169,33 @@ impl Default for FontSize {
     }
 }
 
+/// Everything that varies from one surface to the next.
+#[derive(Debug, Clone)]
+pub struct SurfaceTheme {
+    pub iced_theme: Theme,
+    pub blur: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct AshellTheme {
-    pub iced_theme: Theme,
+    /// One entry per [`Surface`], indexed by `surface as usize`.
+    surfaces: [SurfaceTheme; 4],
+    /// Ink colours, for call sites that read one where there is no `&Theme` to
+    /// hand. `background` here is the un-opacified base, so it is not what any
+    /// surface actually paints; use [`Paint`] for fills.
+    pub palette: Palette,
     pub space: Space,
     pub radius: Radius,
     pub font_size: FontSize,
     pub bar_position: Position,
-    pub bar_style: AppearanceStyle,
-    pub opacity: f32,
+    pub bar_surface: BarSurface,
+    pub bar_radius: BarRadius,
+    pub bar_margin: BarMargin,
+    pub bar_padding: BarPadding,
     pub menu: MenuAppearance,
     pub workspace_colors: Vec<AppearanceColor>,
     pub special_workspace_colors: Option<Vec<AppearanceColor>>,
     pub scale_factor: f64,
-    // Read by animation call sites added in subsequent PRs.
-    #[allow(dead_code)]
     pub animations_enabled: bool,
 }
 
@@ -124,109 +206,317 @@ impl Default for AshellTheme {
     }
 }
 
-fn build_iced_theme(appearance: &Appearance) -> Theme {
+/// Not scaled by the configured opacity: the colour underneath already carries
+/// it, and scaling here would paint that background twice.
+const HOVER_OVERLAY: f32 = 0.04;
+
+/// Straight-alpha "a over b", so only one layer ends up painted.
+fn over(a: Color, b: Color) -> Color {
+    let alpha = a.a + b.a * (1.0 - a.a);
+    if alpha <= f32::EPSILON {
+        return Color::TRANSPARENT;
+    }
+    let channel = |ca: f32, cb: f32| (ca * a.a + cb * b.a * (1.0 - a.a)) / alpha;
+    Color {
+        r: channel(a.r, b.r),
+        g: channel(a.g, b.g),
+        b: channel(a.b, b.b),
+        a: alpha,
+    }
+}
+
+/// Alphas for marks drawn *on* a surface. Fixed ratios of the foreground, as
+/// in Adwaita, so they read the same whatever opacity the surface runs at.
+const TROUGH_ALPHA: f32 = 0.15;
+const THUMB_ALPHA: f32 = 0.4;
+const DIVIDER_ALPHA: f32 = 0.12;
+
+/// The foreground colour at `alpha`: a mark drawn on the surface.
+fn ink(theme: &Theme, alpha: f32) -> Color {
+    theme.palette().text.scale_alpha(alpha)
+}
+
+/// A button that looks like its content in every state: for wrapping an
+/// element only to get hover events (e.g. to show a tooltip) inside a module
+/// whose own button already draws the hover highlight.
+pub fn transparent_button_style(theme: &Theme, _status: Status) -> button::Style {
+    button::Style {
+        background: None,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.,
+            radius: 0.into(),
+        },
+        shadow: Shadow {
+            color: Color::TRANSPARENT,
+            offset: Vector::default(),
+            blur_radius: 0.,
+        },
+        text_color: theme.palette().text,
+        snap: true,
+    }
+}
+
+pub fn slider_style(theme: &Theme, status: slider::Status) -> slider::Style {
+    let mut style = slider::default(theme, status);
+    style.rail.backgrounds.1 = ink(theme, TROUGH_ALPHA).into();
+    style
+}
+
+pub fn scrollable_style(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
+    let mut style = scrollable::default(theme, status);
+    for rail in [&mut style.vertical_rail, &mut style.horizontal_rail] {
+        rail.background = Some(Background::Color(Color::TRANSPARENT));
+        rail.scroller.background = ink(theme, THUMB_ALPHA).into();
+    }
+    style
+}
+
+pub fn toggler_style(theme: &Theme, status: toggler::Status) -> toggler::Style {
+    let mut style = toggler::default(theme, status);
+    let toggled = matches!(
+        status,
+        toggler::Status::Active { is_toggled: true }
+            | toggler::Status::Hovered { is_toggled: true }
+    );
+    if !toggled {
+        style.background = ink(theme, TROUGH_ALPHA).into();
+    }
+    style
+}
+
+pub fn rule_style(theme: &Theme) -> rule::Style {
+    rule::Style {
+        color: ink(theme, DIVIDER_ALPHA),
+        ..rule::default(theme)
+    }
+}
+
+fn troughed(theme: &Theme, base: progress_bar::Style) -> progress_bar::Style {
+    progress_bar::Style {
+        background: ink(theme, TROUGH_ALPHA).into(),
+        ..base
+    }
+}
+
+pub fn progress_bar_primary(theme: &Theme) -> progress_bar::Style {
+    troughed(theme, progress_bar::primary(theme))
+}
+
+pub fn progress_bar_secondary(theme: &Theme) -> progress_bar::Style {
+    troughed(theme, progress_bar::secondary(theme))
+}
+
+pub fn progress_bar_danger(theme: &Theme) -> progress_bar::Style {
+    troughed(theme, progress_bar::danger(theme))
+}
+
+/// The opacity of the surface this theme paints. Lives on the base palette's
+/// background because that is the only colour there that is paint.
+fn surface_opacity(theme: &Theme) -> f32 {
+    theme.palette().background.a
+}
+
+/// A colour that has already been resolved as paint: a fill, or the edge of a
+/// fill. Every such colour is one of two things, and [`Paint`] makes the call
+/// site say which:
+///
+/// - [`Paint::surface`], part of the surface, so it carries the surface
+///   opacity and disappears with it.
+/// - [`Paint::opaque`], drawn *on* the surface, so it keeps its contrast at
+///   any opacity.
+///
+/// A raw palette colour is neither, which is why the fill helpers here take a
+/// `Paint` rather than a `Color`: forgetting the opacity stops compiling
+/// instead of rendering correctly only at the default `opacity = 1.0`.
+#[derive(Debug, Clone, Copy)]
+pub struct Paint(Color);
+
+impl Paint {
+    /// `color` painted as part of the surface, so it carries its opacity.
+    pub fn surface(theme: &Theme, color: Color) -> Self {
+        Self(color.scale_alpha(surface_opacity(theme)))
+    }
+
+    /// `color` painted on top of the surface, keeping its own alpha.
+    pub fn opaque(color: Color) -> Self {
+        Self(color)
+    }
+
+    /// The hover overlay composited in, so hovering paints one layer rather
+    /// than stacking a second one and washing out the translucency.
+    pub fn hovered(self, theme: &Theme) -> Self {
+        Self(over(ink(theme, HOVER_OVERLAY), self.0))
+    }
+
+    /// Crossfade towards `to`. Alpha is interpolated with the colour, so a
+    /// fade from a surface fill to an opaque accent fades the opacity too.
+    pub fn lerp(self, to: Self, t: f32) -> Self {
+        Self(lerp_color(self.0, to.0, t))
+    }
+
+    /// The same paint faded to `factor` of its alpha, for disabled states.
+    pub fn scale_alpha(self, factor: f32) -> Self {
+        Self(self.0.scale_alpha(factor))
+    }
+
+    /// The resolved colour, for the few iced fields that take a bare `Color`.
+    pub fn color(self) -> Color {
+        self.0
+    }
+}
+
+impl From<Paint> for Background {
+    fn from(paint: Paint) -> Self {
+        Background::Color(paint.0)
+    }
+}
+
+/// The 1px edge of a translucent panel. It carries the surface opacity so the
+/// panel fades as one piece instead of keeping a hard outline behind nothing.
+pub fn surface_border(theme: &Theme, radius: impl Into<border::Radius>) -> Border {
+    Border {
+        color: Paint::surface(theme, theme.extended_palette().background.weakest.color).color(),
+        width: 1.0,
+        radius: radius.into(),
+    }
+}
+
+/// The raised panel every menu card is built from: a `background.weak` fill
+/// that carries the surface opacity, rounded by `radius`.
+pub fn card_style(radius: impl Into<border::Radius>) -> impl Fn(&Theme) -> container::Style {
+    let radius = radius.into();
+    move |theme| container::Style {
+        background: Some(
+            Paint::surface(theme, theme.extended_palette().background.weak.color).into(),
+        ),
+        border: Border::default().rounded(radius),
+        ..container::Style::default()
+    }
+}
+
+fn base_palette(appearance: &Appearance) -> Palette {
+    Palette {
+        background: appearance.background_color.get_base(),
+        text: appearance.text_color.get_base(),
+        primary: appearance.primary_color.get_base(),
+        success: appearance.success_color.get_base(),
+        warning: appearance.warning_color.get_base(),
+        danger: appearance.danger_color.get_base(),
+    }
+}
+
+/// The variants derived from `base`. Independent of the surface opacity: every
+/// colour here is either ink or a background forced back to `a: 1.0`, so it is
+/// generated once and shared by all four surface themes.
+fn build_extended(appearance: &Appearance, palette: Palette) -> palette::Extended {
+    let text = palette.text;
+    let bg_text = appearance.background_color.get_text().unwrap_or(text);
+    // `mix` interpolates alpha too, so deriving from the translucent
+    // colour would spread assorted alphas across the variants.
+    let background = Color {
+        a: 1.0,
+        ..palette.background
+    };
+
+    let default_bg = palette::Background::new(background, bg_text);
+    let bg = |level, fallback| {
+        appearance
+            .background_color
+            .get_pair(level, text)
+            .unwrap_or(fallback)
+    };
+
+    let default_primary = palette::Primary::generate(
+        palette.primary,
+        background,
+        appearance.primary_color.get_text().unwrap_or(text),
+    );
+    let default_success = palette::Success::generate(
+        palette.success,
+        background,
+        appearance.success_color.get_text().unwrap_or(text),
+    );
+    let default_warning = palette::Warning::generate(
+        palette.warning,
+        background,
+        appearance.warning_color.get_text().unwrap_or(text),
+    );
+    let default_danger = palette::Danger::generate(
+        palette.danger,
+        background,
+        appearance.danger_color.get_text().unwrap_or(text),
+    );
+
+    palette::Extended {
+        background: palette::Background {
+            base: default_bg.base,
+            weakest: bg(BackgroundLevel::Weakest, default_bg.weakest),
+            weaker: bg(BackgroundLevel::Weaker, default_bg.weaker),
+            weak: bg(BackgroundLevel::Weak, default_bg.weak),
+            neutral: bg(BackgroundLevel::Neutral, default_bg.neutral),
+            strong: bg(BackgroundLevel::Strong, default_bg.strong),
+            stronger: bg(BackgroundLevel::Stronger, default_bg.stronger),
+            strongest: bg(BackgroundLevel::Strongest, default_bg.strongest),
+        },
+        primary: palette::Primary {
+            base: default_primary.base,
+            weak: appearance
+                .primary_color
+                .get_weak_pair(text)
+                .unwrap_or(default_primary.weak),
+            strong: appearance
+                .primary_color
+                .get_strong_pair(text)
+                .unwrap_or(default_primary.strong),
+        },
+        secondary: palette::Secondary::generate(background, text),
+        success: palette::Success {
+            base: default_success.base,
+            weak: appearance
+                .success_color
+                .get_weak_pair(text)
+                .unwrap_or(default_success.weak),
+            strong: appearance
+                .success_color
+                .get_strong_pair(text)
+                .unwrap_or(default_success.strong),
+        },
+        warning: palette::Warning {
+            base: default_warning.base,
+            weak: appearance
+                .warning_color
+                .get_weak_pair(text)
+                .unwrap_or(default_warning.weak),
+            strong: appearance
+                .warning_color
+                .get_strong_pair(text)
+                .unwrap_or(default_warning.strong),
+        },
+        danger: palette::Danger {
+            base: default_danger.base,
+            weak: appearance
+                .danger_color
+                .get_weak_pair(text)
+                .unwrap_or(default_danger.weak),
+            strong: appearance
+                .danger_color
+                .get_strong_pair(text)
+                .unwrap_or(default_danger.strong),
+        },
+        is_dark: true,
+    }
+}
+
+fn build_iced_theme(base: Palette, extended: palette::Extended, opacity: f32) -> Theme {
     Theme::custom_with_fn(
-        "local".to_string(),
+        "local",
         Palette {
-            background: appearance.background_color.get_base(),
-            text: appearance.text_color.get_base(),
-            primary: appearance.primary_color.get_base(),
-            success: appearance.success_color.get_base(),
-            warning: appearance.warning_color.get_base(),
-            danger: appearance.danger_color.get_base(),
+            // The one colour here that is paint; the accents are read as ink.
+            background: base.background.scale_alpha(opacity),
+            ..base
         },
-        |palette| {
-            let text = palette.text;
-            let bg_text = appearance.background_color.get_text().unwrap_or(text);
-
-            let default_bg = palette::Background::new(palette.background, bg_text);
-            let bg = |level, fallback| {
-                appearance
-                    .background_color
-                    .get_pair(level, text)
-                    .unwrap_or(fallback)
-            };
-
-            let default_primary = palette::Primary::generate(
-                palette.primary,
-                palette.background,
-                appearance.primary_color.get_text().unwrap_or(text),
-            );
-            let default_success = palette::Success::generate(
-                palette.success,
-                palette.background,
-                appearance.success_color.get_text().unwrap_or(text),
-            );
-            let default_warning = palette::Warning::generate(
-                palette.warning,
-                palette.background,
-                appearance.warning_color.get_text().unwrap_or(text),
-            );
-            let default_danger = palette::Danger::generate(
-                palette.danger,
-                palette.background,
-                appearance.danger_color.get_text().unwrap_or(text),
-            );
-
-            palette::Extended {
-                background: palette::Background {
-                    base: default_bg.base,
-                    weakest: bg(BackgroundLevel::Weakest, default_bg.weakest),
-                    weaker: bg(BackgroundLevel::Weaker, default_bg.weaker),
-                    weak: bg(BackgroundLevel::Weak, default_bg.weak),
-                    neutral: bg(BackgroundLevel::Neutral, default_bg.neutral),
-                    strong: bg(BackgroundLevel::Strong, default_bg.strong),
-                    stronger: bg(BackgroundLevel::Stronger, default_bg.stronger),
-                    strongest: bg(BackgroundLevel::Strongest, default_bg.strongest),
-                },
-                primary: palette::Primary {
-                    base: default_primary.base,
-                    weak: appearance
-                        .primary_color
-                        .get_weak_pair(text)
-                        .unwrap_or(default_primary.weak),
-                    strong: appearance
-                        .primary_color
-                        .get_strong_pair(text)
-                        .unwrap_or(default_primary.strong),
-                },
-                secondary: palette::Secondary::generate(palette.background, text),
-                success: palette::Success {
-                    base: default_success.base,
-                    weak: appearance
-                        .success_color
-                        .get_weak_pair(text)
-                        .unwrap_or(default_success.weak),
-                    strong: appearance
-                        .success_color
-                        .get_strong_pair(text)
-                        .unwrap_or(default_success.strong),
-                },
-                warning: palette::Warning {
-                    base: default_warning.base,
-                    weak: appearance
-                        .warning_color
-                        .get_weak_pair(text)
-                        .unwrap_or(default_warning.weak),
-                    strong: appearance
-                        .warning_color
-                        .get_strong_pair(text)
-                        .unwrap_or(default_warning.strong),
-                },
-                danger: palette::Danger {
-                    base: default_danger.base,
-                    weak: appearance
-                        .danger_color
-                        .get_weak_pair(text)
-                        .unwrap_or(default_danger.weak),
-                    strong: appearance
-                        .danger_color
-                        .get_strong_pair(text)
-                        .unwrap_or(default_danger.strong),
-                },
-                is_dark: true,
-            }
-        },
+        move |_| extended,
     )
 }
 
@@ -235,19 +525,32 @@ fn base_theme_from_appearance(
     bar_position: Position,
     animations_enabled: bool,
 ) -> AshellTheme {
+    let palette = base_palette(appearance);
+    let extended = build_extended(appearance, palette);
+
     AshellTheme {
         space: Space::default(),
         radius: Radius::default(),
         font_size: FontSize::default(),
         bar_position,
-        bar_style: appearance.style,
-        opacity: appearance.opacity,
+        bar_surface: appearance.bar.surface,
+        bar_radius: appearance.bar.radius,
+        bar_margin: appearance.bar.margin,
+        bar_padding: appearance.bar.padding,
         menu: appearance.menu,
         workspace_colors: appearance.workspace_colors.clone(),
         special_workspace_colors: appearance.special_workspace_colors.clone(),
         scale_factor: appearance.scale_factor,
         animations_enabled,
-        iced_theme: build_iced_theme(appearance),
+        palette,
+        surfaces: Surface::ALL.map(|surface| {
+            let opacity = appearance.opacity.get(surface);
+
+            SurfaceTheme {
+                iced_theme: build_iced_theme(palette, extended, opacity),
+                blur: appearance.blur.enabled(opacity),
+            }
+        }),
     }
 }
 
@@ -260,6 +563,23 @@ impl AshellTheme {
         base_theme_from_appearance(appearance, position, animations.enabled)
     }
 
+    pub fn surface(&self, surface: Surface) -> &SurfaceTheme {
+        &self.surfaces[surface as usize]
+    }
+
+    pub fn bar_layout(&self) -> BarLayout {
+        BarLayout::new(self.bar_surface, self.bar_margin, self.bar_padding)
+    }
+
+    pub fn bar_border_radius(&self) -> border::Radius {
+        border::Radius {
+            top_left: self.radius.resolve(self.bar_radius.top_left),
+            top_right: self.radius.resolve(self.bar_radius.top_right),
+            bottom_right: self.radius.resolve(self.bar_radius.bottom_right),
+            bottom_left: self.radius.resolve(self.bar_radius.bottom_left),
+        }
+    }
+
     pub fn button_style(
         &self,
         kind: ButtonKind,
@@ -269,7 +589,6 @@ impl AshellTheme {
             ButtonKind::Transparent => self.radius.sm,
             ButtonKind::Solid | ButtonKind::Outline => self.radius.xl,
         };
-        let opacity = self.opacity;
 
         move |theme: &Theme, status: Status| {
             let palette = theme.palette();
@@ -277,22 +596,22 @@ impl AshellTheme {
 
             let (base_bg, hover_bg, base_text, hover_text, border_color) = match hierarchy {
                 ButtonHierarchy::Primary => (
-                    palette.primary,
-                    ext.primary.weak.color,
+                    Paint::opaque(palette.primary),
+                    Paint::opaque(ext.primary.weak.color),
                     ext.primary.base.text,
                     ext.primary.base.text,
                     palette.primary,
                 ),
                 ButtonHierarchy::Secondary => (
-                    ext.background.weak.color,
-                    ext.background.strong.color,
+                    Paint::surface(theme, ext.background.weak.color),
+                    Paint::surface(theme, ext.background.strong.color),
                     palette.text,
                     palette.text,
                     ext.background.weak.color,
                 ),
                 ButtonHierarchy::Danger => (
-                    palette.danger,
-                    ext.danger.weak.color,
+                    Paint::opaque(palette.danger),
+                    Paint::opaque(ext.danger.weak.color),
                     ext.danger.base.text,
                     ext.danger.base.text,
                     palette.danger,
@@ -301,7 +620,7 @@ impl AshellTheme {
 
             match (kind, status) {
                 (ButtonKind::Solid, Status::Active) => button::Style {
-                    background: Some(base_bg.scale_alpha(opacity).into()),
+                    background: Some(base_bg.into()),
                     border: Border {
                         width: 0.0,
                         radius: radius.into(),
@@ -311,7 +630,7 @@ impl AshellTheme {
                     ..button::Style::default()
                 },
                 (ButtonKind::Solid, Status::Hovered) => button::Style {
-                    background: Some(hover_bg.scale_alpha(opacity).into()),
+                    background: Some(hover_bg.into()),
                     border: Border {
                         width: 0.0,
                         radius: radius.into(),
@@ -364,8 +683,9 @@ impl AshellTheme {
                     text_color: palette.text,
                     ..button::Style::default()
                 },
+                // Transparent at rest, so hover adds an overlay, not a background.
                 (ButtonKind::Outline, Status::Hovered) => button::Style {
-                    background: Some(base_bg.scale_alpha(opacity).into()),
+                    background: Some(palette.text.scale_alpha(HOVER_OVERLAY).into()),
                     border: Border {
                         width: 2.0,
                         radius: radius.into(),
@@ -379,9 +699,7 @@ impl AshellTheme {
                     let disabled_opacity = 0.3;
                     match kind {
                         ButtonKind::Solid => button::Style {
-                            background: Some(
-                                base_bg.scale_alpha(opacity * disabled_opacity).into(),
-                            ),
+                            background: Some(base_bg.scale_alpha(disabled_opacity).into()),
                             border: Border {
                                 width: 0.0,
                                 radius: radius.into(),
@@ -432,7 +750,6 @@ impl AshellTheme {
         active: f32,
     ) -> impl Fn(&Theme, Status) -> button::Style + use<> {
         let radius_lg = self.radius.lg;
-        let opacity = self.opacity;
         move |theme: &Theme, status: Status| {
             let mut base = button::Style {
                 background: None,
@@ -450,16 +767,9 @@ impl AshellTheme {
             };
             match status {
                 Status::Active => base,
+                // Transparent at rest, so hover adds an overlay, not a background.
                 Status::Hovered => {
-                    base.background = Some(
-                        theme
-                            .extended_palette()
-                            .background
-                            .weak
-                            .color
-                            .scale_alpha(opacity)
-                            .into(),
-                    );
+                    base.background = Some(theme.palette().text.scale_alpha(HOVER_OVERLAY).into());
                     base.text_color = theme.palette().text;
                     base
                 }
@@ -472,12 +782,11 @@ impl AshellTheme {
         &self,
         active: f32,
     ) -> impl Fn(&Theme, Status) -> button::Style + use<> {
-        let opacity = self.opacity;
         let radius = self.radius.xl;
         move |theme: &Theme, status: Status| {
-            let inactive_bg = theme.extended_palette().background.weak.color;
-            let active_bg = theme.palette().primary;
-            let bg = lerp_color(inactive_bg, active_bg, active).scale_alpha(opacity);
+            let inactive_bg = Paint::surface(theme, theme.extended_palette().background.weak.color);
+            let active_bg = Paint::opaque(theme.extended_palette().primary.base.color);
+            let bg = inactive_bg.lerp(active_bg, active);
 
             let mut base = button::Style {
                 background: Some(bg.into()),
@@ -496,13 +805,10 @@ impl AshellTheme {
             match status {
                 Status::Active => base,
                 Status::Hovered => {
-                    let inactive_hover = theme.extended_palette().background.strong.color;
-                    let active_hover = theme.extended_palette().primary.weak.color;
-                    base.background = Some(
-                        lerp_color(inactive_hover, active_hover, active)
-                            .scale_alpha(opacity)
-                            .into(),
-                    );
+                    let inactive_hover =
+                        Paint::surface(theme, theme.extended_palette().background.strong.color);
+                    let active_hover = Paint::opaque(theme.extended_palette().primary.weak.color);
+                    base.background = Some(inactive_hover.lerp(active_hover, active).into());
                     base
                 }
                 _ => base,
@@ -514,102 +820,116 @@ impl AshellTheme {
         &self,
         is_empty: bool,
         is_urgent: bool,
+        is_active: bool,
         colors: Option<Option<AppearanceColor>>,
     ) -> impl Fn(&Theme, Status) -> button::Style + use<> {
         let radius_lg = self.radius.lg;
         move |theme: &Theme, status: Status| {
-            let (bg_color, fg_color) = colors.map_or_else(
-                || {
-                    (
-                        theme.extended_palette().background.weak.color,
-                        theme.palette().text,
-                    )
-                },
-                |c| {
-                    c.map_or_else(
-                        || {
-                            (
-                                theme.extended_palette().primary.base.color,
-                                theme.extended_palette().primary.base.text,
-                            )
-                        },
-                        |c| {
-                            let color = palette::Primary::generate(
-                                c.get_base(),
-                                theme.palette().background,
-                                c.get_text().unwrap_or_else(|| theme.palette().text),
-                            );
-                            (color.base.color, color.base.text)
-                        },
-                    )
-                },
-            );
-            let urgent_color = theme.palette().danger;
+            // An active or urgent workspace is a mark drawn on the bar, so it
+            // stays opaque; everything else is part of the bar and fades with it.
+            let fill = |color: Color| Paint::surface(theme, color);
+            let opaque = Paint::opaque;
+            let primary = colors.map(|c| {
+                c.map_or_else(
+                    || theme.extended_palette().primary,
+                    |c| {
+                        palette::Primary::generate(
+                            c.get_base(),
+                            theme.palette().background,
+                            c.get_text().unwrap_or_else(|| theme.palette().text),
+                        )
+                    },
+                )
+            });
+            let resolve = |bg: fn(&palette::Background) -> palette::Pair,
+                           pr: fn(&palette::Primary) -> palette::Pair| {
+                match primary {
+                    Some(p) => {
+                        let pair = pr(&p);
+                        (pair.color, pair.text)
+                    }
+                    None => {
+                        let pair = bg(&theme.extended_palette().background);
+                        (pair.color, theme.palette().text)
+                    }
+                }
+            };
+            let (bg_color, fg_color) = resolve(|b| b.weak, |p| p.base);
+            let (bg_strong, fg_strong) = resolve(|b| b.strong, |p| p.strong);
+            let (bg_weak, fg_weak) = resolve(|b| b.weak, |p| p.weak);
             let mut base = button::Style {
-                background: Some(Background::Color(if is_urgent && is_empty {
-                    urgent_color
-                } else if is_empty {
-                    theme.extended_palette().background.weak.color
-                } else {
-                    bg_color
-                })),
+                background: Some(
+                    if is_urgent && is_empty {
+                        opaque(theme.extended_palette().danger.base.color)
+                    } else if is_empty && is_active {
+                        opaque(theme.extended_palette().background.strong.color)
+                    } else if is_empty {
+                        fill(theme.extended_palette().background.weak.color)
+                    } else if is_active {
+                        opaque(bg_color)
+                    } else {
+                        fill(bg_weak)
+                    }
+                    .into(),
+                ),
                 border: Border {
                     width: if is_urgent || is_empty { 1.0 } else { 0.0 },
-                    color: if is_urgent { urgent_color } else { bg_color },
+                    color: if is_urgent {
+                        theme.extended_palette().danger.base.color
+                    } else if is_active {
+                        bg_color
+                    } else {
+                        bg_weak
+                    },
                     radius: radius_lg.into(),
                 },
                 text_color: if is_urgent && is_empty {
                     theme.extended_palette().danger.base.text
+                } else if is_empty && is_active {
+                    theme.extended_palette().background.strong.text
                 } else if is_empty {
                     theme.extended_palette().background.weak.text
-                } else {
+                } else if is_active {
                     fg_color
+                } else {
+                    fg_weak
                 },
                 ..button::Style::default()
             };
             match status {
                 Status::Active => base,
                 Status::Hovered => {
-                    let (bg_color, fg_color) = colors.map_or_else(
-                        || {
-                            (
-                                theme.extended_palette().background.strong.color,
-                                theme.palette().text,
-                            )
-                        },
-                        |c| {
-                            c.map_or_else(
-                                || {
-                                    (
-                                        theme.extended_palette().primary.strong.color,
-                                        theme.extended_palette().primary.strong.text,
-                                    )
-                                },
-                                |c| {
-                                    let color = palette::Primary::generate(
-                                        c.get_base(),
-                                        theme.palette().background,
-                                        c.get_text().unwrap_or_else(|| theme.palette().text),
-                                    );
-                                    (color.strong.color, color.strong.text)
-                                },
-                            )
-                        },
+                    base.background = Some(
+                        if is_urgent && is_empty {
+                            opaque(theme.extended_palette().danger.strong.color)
+                        } else if is_empty && is_active {
+                            opaque(theme.extended_palette().background.strong.color)
+                        } else if is_empty {
+                            fill(theme.extended_palette().background.strong.color)
+                        } else if is_active {
+                            opaque(bg_color)
+                        } else {
+                            fill(bg_strong)
+                        }
+                        .into(),
                     );
-
-                    base.background = Some(Background::Color(if is_urgent && is_empty {
+                    base.border.color = if is_urgent && is_active {
+                        theme.extended_palette().danger.base.color
+                    } else if is_urgent {
                         theme.extended_palette().danger.strong.color
-                    } else if is_empty {
-                        theme.extended_palette().background.strong.color
-                    } else {
+                    } else if is_active {
                         bg_color
-                    }));
+                    } else {
+                        bg_strong
+                    };
                     base.text_color = if is_urgent && is_empty {
                         theme.extended_palette().danger.strong.text
                     } else if is_empty {
-                        theme.extended_palette().background.weak.text
-                    } else {
+                        theme.extended_palette().background.strong.text
+                    } else if is_active {
                         fg_color
+                    } else {
+                        fg_strong
                     };
                     base
                 }
@@ -642,7 +962,9 @@ impl AshellTheme {
                     base
                 }
                 text_input::Status::Disabled => {
-                    base.background = theme.extended_palette().background.weak.color.into();
+                    base.background =
+                        Paint::surface(theme, theme.extended_palette().background.weak.color)
+                            .into();
                     base.border.color = Color::TRANSPARENT;
                     base
                 }
@@ -651,10 +973,9 @@ impl AshellTheme {
     }
 
     /// Module button style: transparent base with hover highlight.
-    /// The Islands background is handled by `module_group`, not the button.
+    /// The module-group background is handled by `module_group`, not the button.
     pub fn module_button_style(&self) -> impl Fn(&Theme, Status) -> button::Style + use<> {
         let radius_lg = self.radius.lg;
-        let opacity = self.opacity;
         move |theme, status| {
             let mut base = button::Style {
                 background: None,
@@ -668,16 +989,9 @@ impl AshellTheme {
             };
             match status {
                 Status::Active => base,
+                // The group pill already carries the opacity; overlay on it.
                 Status::Hovered => {
-                    base.background = Some(
-                        theme
-                            .extended_palette()
-                            .background
-                            .weak
-                            .color
-                            .scale_alpha(opacity)
-                            .into(),
-                    );
+                    base.background = Some(theme.palette().text.scale_alpha(HOVER_OVERLAY).into());
                     base
                 }
                 _ => base,

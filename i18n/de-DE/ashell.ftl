@@ -11,13 +11,13 @@ updates-available =
         [one] { $count } Update verfügbar
        *[other] { $count } Updates verfügbar
     }
-updates-button-update = Jetzt Aktualisieren
+updates-button-update = Jetzt aktualisieren
 updates-button-check-now = Nach Updates prüfen
 
 ## Medienwiedergabe Modul
 media-player-not-connected = Nicht mit dem MPRIS-Dienst verbunden
 media-player-heading = Player
-media-player-loading-cover = Cover wird geladen...
+media-player-loading-cover = Cover wird geladen …
 media-player-no-title = Kein Titel
 media-player-unknown-artist = Unbekannter Künstler
 media-player-unknown-album = Unbekanntes Album
@@ -29,8 +29,21 @@ password-dialog-open-network-warning =
     "{ $ssid }" ist ein offenes Netzwerk. Daten, die über diese Verbindung gesendet werden, könnten für andere sichtbar sein.
     Trotzdem verbinden?
 password-dialog-insert-password = Passwort eingeben für: { $ssid }
+password-dialog-connect-once = Nur dieses Mal verbinden
 password-dialog-cancel = Abbrechen
 password-dialog-confirm = Bestätigen
+
+## WLAN teilen
+share-wifi-title = WLAN teilen
+share-wifi-subtitle =
+    Diesen QR-Code mit einem anderen Gerät scannen, um
+    „{ $ssid }“ beizutreten
+share-wifi-password-label = WLAN-Passwort:
+share-wifi-password-open-network = Offenes Netzwerk — kein Passwort erforderlich.
+share-wifi-password-unavailable-message = Das Passwort dieses Netzwerks ist nicht lesbar und kann daher nicht geteilt werden.
+share-wifi-unsupported-message = Die Authentifizierungsmethode dieses Netzwerks kann nicht per QR-Code geteilt werden.
+share-wifi-error-message = Das WLAN-Passwort konnte nicht gelesen werden.
+share-wifi-close = Schließen
 
 ## OSD
 osd-airplane-toggle =
@@ -40,12 +53,12 @@ osd-airplane-toggle =
     }
 osd-idle-inhibitor-toggle =
     { $state ->
-        [on] Ruhezustand wird verhindert
-       *[off] Ruhezustand wird erlaubt
+        [on] Standby wird verhindert
+       *[off] Standby wird erlaubt
     }
 
 ## Einstellungen — Geteilt
-settings-scanning = Wird gesucht...
+settings-scanning = Wird gesucht …
 settings-more = Mehr
 
 ## Einstellungen — Netzwerk
@@ -62,7 +75,7 @@ settings-network-nearby-wifi = Verfügbare WLANs
 ## Einstellungen — Bluetooth
 settings-bluetooth = Bluetooth
 settings-bluetooth-devices = Bluetooth-Geräte
-settings-bluetooth-known-devices = Bekannte Geräte
+settings-bluetooth-known-devices = Gekoppelte Geräte
 settings-bluetooth-available = Verfügbar
 settings-bluetooth-pair = Koppeln
 settings-bluetooth-no-devices = Keine Geräte gefunden
@@ -73,27 +86,36 @@ settings-bluetooth-connected-count =
     }
 
 ## Einstellungen — Energie
-settings-power-suspend = Ruhezustand
-settings-power-hibernate = Tiefschlaf
+settings-power-suspend = Standby
+settings-power-hibernate = Ruhezustand
 settings-power-reboot = Neustart
 settings-power-shutdown = Herunterfahren
 settings-power-logout = Abmelden
-settings-power-calculating = Wird berechnet...
+settings-power-calculating = Wird berechnet …
 settings-power-full-in = Voll in { $duration }
 settings-power-empty-in = Leer in { $duration }
 settings-power-charge-limit = Ladebegrenzung
-settings-power-profile-balanced = Ausgewogen
+settings-power-profile-balanced = Ausgeglichen
 settings-power-profile-performance = Leistung
-settings-power-profile-power-saver = Stromsparen
+settings-power-profile-power-saver = Energie sparen
 
 settings-power-status-charging = Wird geladen
-settings-power-status-discharging = Entlädt sich
+settings-power-status-discharging = Wird entladen
 settings-power-status-not-charging = Lädt nicht
 settings-power-status-unknown = Unbekannt
 settings-power-status-full = Voll
+settings-power-health = Zustand { $percentage } % ({ $energy_full } / { $energy_full_design } Wh)
+settings-power-charge-cycles =
+    { $count ->
+        [one] { $count } Ladezyklus
+       *[other] { $count } Ladezyklen
+    }
 
-## Einstellungen — Kein Ruhezustand
-settings-idle-inhibitor = Kein Ruhezustand
+## Einstellungen — Kein Standby
+settings-idle-inhibitor = Kein Standby
+
+## Einstellungen — Nicht stören
+settings-dnd = Nicht stören
 
 ## Einstellungen — tooltips
 settings-tooltip-empty = Ziemlich leer hier
@@ -104,7 +126,7 @@ settings-tooltip-empty-vpn = Kein aktives VPN
 settings-tooltip-empty-battery = Keine Akku-Informationen
 
 ## Tempo / Wetter Modul
-tempo-feels-like = Gefühlte { $value }{ $unit }
+tempo-feels-like = Gefühlt { $value }{ $unit }
 tempo-humidity = Luftfeuchte
 tempo-wind = Wind
 
@@ -112,28 +134,28 @@ tempo-wind = Wind
 weather-clear-sky = Klarer Himmel
 weather-mainly-clear = Überwiegend klar
 weather-partly-cloudy = Teilweise bewölkt
-weather-overcast = Bewölkt
+weather-overcast = Bedeckt
 weather-fog = Nebel
 weather-fog-rime = Raureifnebel
 weather-drizzle-light = Leichter Nieselregen
-weather-drizzle-moderate = Nieselregen
+weather-drizzle-moderate = Mäßiger Nieselregen
 weather-drizzle-dense = Starker Nieselregen
 weather-drizzle-freezing-light = Leichter gefrierender Nieselregen
 weather-drizzle-freezing-dense = Starker gefrierender Nieselregen
 weather-rain-slight = Leichter Regen
-weather-rain-moderate = Regen
+weather-rain-moderate = Mäßiger Regen
 weather-rain-heavy = Starker Regen
 weather-rain-freezing-light = Leichter gefrierender Regen
 weather-rain-freezing-heavy = Starker gefrierender Regen
 weather-snow-slight = Leichter Schneefall
-weather-snow-moderate = Schneefall
+weather-snow-moderate = Mäßiger Schneefall
 weather-snow-heavy = Starker Schneefall
 weather-snow-grains = Schneegriesel
 weather-rain-showers-slight = Leichte Regenschauer
 weather-rain-showers-moderate = Regenschauer
 weather-rain-showers-violent = Heftige Regenschauer
 weather-snow-showers-slight = Leichte Schneeschauer
-weather-snow-showers-heavy = Dichte Schneeschauer
+weather-snow-showers-heavy = Starke Schneeschauer
 weather-thunderstorm = Gewitter
 weather-thunderstorm-hail-slight = Gewitter mit leichtem Hagel
 weather-thunderstorm-hail-heavy = Gewitter mit starkem Hagel
@@ -153,5 +175,5 @@ system-info-swap-indicator-prefix = Swap
 system-info-temperature = Temperatur
 system-info-disk-usage = Festplattennutzung { $mount }
 system-info-ip-address = IP-Adresse
-system-info-download-speed = Download
-system-info-upload-speed = Upload
+system-info-download-speed = Download-Geschwindigkeit
+system-info-upload-speed = Upload-Geschwindigkeit

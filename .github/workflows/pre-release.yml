@@ -17,7 +17,7 @@ jobs:
       REPO: ${{ github.repository }}
       GH_TOKEN: ${{ secrets.RELEASE_PAT }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: main
           token: ${{ secrets.RELEASE_PAT }}
@@ -78,19 +78,19 @@ jobs:
           # Install cargo-edit for `cargo set-version`
           cargo install cargo-edit -f --no-default-features --features "set-version"
 
-          # Update the root package version
-          cargo set-version "${VERSION}"
+          # Update every workspace member, so the crates stay in step with ashell
+          cargo set-version --workspace "${VERSION}"
 
       - name: Git add updated cargo toml
         run: |
           git add Cargo.toml Cargo.lock
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v5
+        uses: pnpm/action-setup@v6
         with:
           version: 10
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: pnpm
@@ -134,7 +134,7 @@ jobs:
       REPO: ${{ github.repository }}
       GH_TOKEN: ${{ secrets.RELEASE_PAT }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: main
 

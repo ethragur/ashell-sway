@@ -13,6 +13,7 @@ A **custom module** allows you to:
 - Run a command when the module is clicked.
 - Change icons dynamically based on output.
 - Show an alert indicator based on specific conditions.
+- Show a tooltip on hover.
 
 :::warning
 
@@ -31,15 +32,25 @@ To define a custom module, use the following fields:
 
 - `name`: Name of the module. Use this to refer to it in the [modules definitions](./index.md).
 - `type` _(optional)_: Display type. Can be `Button` (clickable, default) or `Text` (display only).
-- `icon`: Icon displayed in the status bar (for `button` type).
-- `command`: Command to execute when the module is clicked (for `button` type). Empty or whitespace-only values are treated as unset.
-- `on_right_click` _(optional)_: Command to execute on right-click.
-- `on_middle_click` _(optional)_: Command to execute on middle-click.
-- `on_scroll_up` _(optional)_: Command to execute when scrolling up over the module.
-- `on_scroll_down` _(optional)_: Command to execute when scrolling down over the module.
+- `icon` _(optional)_: Icon displayed in the status bar (`Button` only).
+- `command` _(optional)_: Command to execute when the module is clicked (`Button` only). Empty or whitespace-only values are treated as unset.
+- `on_right_click` _(optional)_: Command to execute on right-click (`Button` only).
+- `on_middle_click` _(optional)_: Command to execute on middle-click (`Button` only).
+- `on_scroll_up` _(optional)_: Command to execute when scrolling up over the module (`Button` only).
+- `on_scroll_down` _(optional)_: Command to execute when scrolling down over the module (`Button` only).
 - `listen_cmd` _(optional)_: Command to run in the background to update the module's display. Empty or whitespace-only values are treated as unset.
-- `icons` _(optional)_: Regex-to-icon mapping to change the icon based on the `listen_cmd` output (for `button` type). The first matching regex wins; since the mappings are stored as a map, the evaluation order is not guaranteed. Prefer mutually exclusive regexes or keep patterns precise to avoid ambiguous matches.
-- `alert` _(optional)_: Regex to trigger a red alert dot on the icon when matched in the `listen_cmd` output (for `button` type).
+- `icons` _(optional)_: Regex-to-icon mapping matched against `alt` from the `listen_cmd` output (`Button` only). The first matching regex wins; since the mappings are stored as a map, the evaluation order is not guaranteed. Prefer mutually exclusive regexes or keep patterns precise to avoid ambiguous matches.
+- `alert` _(optional)_: Regex matched against `alt` to trigger a red alert dot on the icon (`Button` only).
+
+:::note
+A `Text` module has no interactions at all: `command`, `on_right_click`,
+`on_middle_click`, `on_scroll_up` and `on_scroll_down` are ignored, and so are
+`icon`, `icons` and `alert`. It renders only the `text` field coming from
+`listen_cmd`, and renders nothing when that field is absent or empty. The
+[`tooltip`](#tooltip) field still works on a `Text` module.
+
+`icons` and `alert` match against `alt`, not against `text`.
+:::
 
 ---
 
@@ -65,7 +76,14 @@ rather than polling every second.
 
 The `listen_cmd` should output JSON in
 the [Waybar format](https://github.com/Alexays/Waybar/wiki/Module:-Custom#script-output),
-using `text` and `alt` fields.
+using the `text`, `alt` and `tooltip` fields.
+
+:::warning
+`alt` is **required**. A payload without it fails to parse, the error is logged
+and the update is dropped, so emit `"alt": ""` even when you have nothing to
+match on. `text` and `tooltip` are optional; only `text`, `alt` and `tooltip` are read,
+any other Waybar field (`class`, `percentage`, `tooltip-format`) is ignored.
+:::
 
 :::tip JSON Output
 
@@ -117,6 +135,23 @@ See the configuration examples below for multiline usage.
 ```json
 {"text": "3", "alt": "notification"}
 ```
+
+### Tooltip
+
+When the payload has a non-empty `tooltip`, hovering over the module shows it in
+a popup. Use `\n` to split it over several lines:
+
+```json
+{"text": "11:00 Standup", "alt": "", "tooltip": "11:00 Standup\n14:00 Review"}
+```
+
+To remove the tooltip, emit a payload without it or with an empty string; an
+open tooltip closes right away.
+
+The tooltip is plain text: Waybar's Pango markup (`<b>`, `<span>`, ...) is
+shown as is. It is not affected by `enable_tooltips` in the
+[settings module](./settings.md#tooltips), which only covers the settings
+indicators.
 
 ---
 
@@ -256,8 +291,10 @@ command = "cliphist-rofi-img | wl-copy"
 
 ## Migration from Deprecated Modules
 
-The `AppLauncher` and `Clipboard` modules have been deprecated in favor of custom modules.
-To migrate from the deprecated modules:
+The `AppLauncher` and `Clipboard` modules have been replaced by custom modules.
+The old `app_launcher_cmd` and `clipboard_cmd` keys no longer exist: ashell
+ignores them and logs `Unknown configuration field ignored: app_launcher_cmd`
+at startup (also printed to stderr). To migrate:
 
 ### Previous App Launcher Configuration
 
@@ -272,7 +309,7 @@ app_launcher_cmd = "walker"
 # New recommended way
 [[CustomModule]]
 name = "AppLauncher"
-icon = "�"
+icon = "󱗼"
 command = "walker"
 ```
 

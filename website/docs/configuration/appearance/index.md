@@ -12,6 +12,5 @@ You can customize things like:
 - The color palette
 - The font used
 - The scaling factor of the status bar
-- The style of the status bar
-- The opacity of the status bar components
-- The opacity of the status bar menus
+- The surface, radius and margin of the status bar
+- The opacity of every surface, together or one by one

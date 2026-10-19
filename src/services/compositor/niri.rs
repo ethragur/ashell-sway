@@ -6,10 +6,10 @@ use crate::services::ServiceEvent;
 use anyhow::{Context, Result, anyhow};
 use itertools::Itertools;
 use niri_ipc::{
-    Action, Event, Reply, Request, WorkspaceReferenceArg,
+    Action, Event, Reply, Request, Response, WorkspaceReferenceArg,
     state::{EventStreamState, EventStreamStatePart},
 };
-use std::{env, os::unix::net::UnixStream as StdUnixStream};
+use std::{collections::HashMap, env, os::unix::net::UnixStream as StdUnixStream};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -31,7 +31,8 @@ pub async fn execute_command(cmd: CompositorCommand) -> Result<()> {
                 ));
             }
         },
-        CompositorCommand::FocusSpecialWorkspace(_)
+        CompositorCommand::FocusNamedWorkspace(_)
+        | CompositorCommand::FocusSpecialWorkspace(_)
         | CompositorCommand::ToggleSpecialWorkspace(_) => {
             return Err(anyhow!("Special workspaces not supported in Niri backend"));
         }
@@ -50,13 +51,15 @@ pub async fn execute_command(cmd: CompositorCommand) -> Result<()> {
         },
         CompositorCommand::CustomDispatch(action, args) => {
             if action == "spawn" {
-                Action::Spawn {
-                    command: vec![args],
-                }
+                Action::SpawnSh { command: args }
             } else {
                 return Err(anyhow!("Unknown custom dispatch: {}", action));
             }
         }
+
+        CompositorCommand::FocusAppWindow { pid, apps, title } => Action::FocusWindow {
+            id: app_window_id(pid, &apps, title.as_deref()).await?,
+        },
     };
 
     send_command_request(&mut stream, Request::Action(action)).await?;
@@ -146,6 +149,10 @@ async fn connect() -> Result<UnixStream> {
 }
 
 async fn send_command_request(stream: &mut UnixStream, request: Request) -> Result<()> {
+    send_request(stream, request).await.map(|_| ())
+}
+
+async fn send_request(stream: &mut UnixStream, request: Request) -> Result<Response> {
     let mut json = serde_json::to_string(&request)?;
     json.push('\n');
     stream.write_all(json.as_bytes()).await?;
@@ -156,11 +163,53 @@ async fn send_command_request(stream: &mut UnixStream, request: Request) -> Resu
     reader.read_line(&mut response_line).await?;
 
     let reply: Reply = serde_json::from_str(&response_line)?;
-    reply.map_err(|e| anyhow!("Niri error: {}", e)).map(|_| ())
+    reply.map_err(|e| anyhow!("Niri error: {}", e))
+}
+
+async fn app_window_id(pid: Option<u32>, apps: &[String], title: Option<&str>) -> Result<u64> {
+    let mut stream = connect().await?;
+
+    let Response::Windows(windows) = send_request(&mut stream, Request::Windows).await? else {
+        return Err(anyhow!("Unexpected reply to a Niri windows request"));
+    };
+
+    // XWayland windows report xwayland-satellite's pid, so fall back to the app
+    // id when no window has the player's pid.
+    let by_pid: Vec<_> = windows
+        .iter()
+        .filter(|w| {
+            w.pid
+                .zip(pid)
+                .is_some_and(|(w, p)| i64::from(w) == i64::from(p))
+        })
+        .collect();
+    let candidates = if by_pid.is_empty() {
+        windows
+            .iter()
+            .filter(|w| super::app_matches(w.app_id.as_deref(), apps))
+            .collect()
+    } else {
+        by_pid
+    };
+
+    // Prefer the window whose title shows the media, then the focused one (none
+    // usually is while ashell's menu is open), then the most recently focused;
+    // windows never focused sort last.
+    candidates
+        .into_iter()
+        .max_by_key(|w| {
+            (
+                super::title_matches(w.title.as_deref(), title),
+                w.is_focused,
+                w.focus_timestamp.map(|t| (t.secs, t.nanos)),
+            )
+        })
+        .map(|w| w.id)
+        .ok_or_else(|| anyhow!("No window found for pid {pid:?} or apps {apps:?}"))
 }
 
 fn map_state(niri: &EventStreamState) -> CompositorState {
-    let output_to_active_ws: std::collections::HashMap<_, _> = niri
+    let output_to_active_ws: HashMap<_, _> = niri
         .workspaces
         .workspaces
         .values()
@@ -181,15 +230,34 @@ fn map_state(niri: &EventStreamState) -> CompositorState {
         .sorted_unstable()
         .collect::<Vec<_>>();
 
+    let collect_classes = super::should_collect_window_classes();
+
+    // Collect window classes per workspace (by visual index)
+    let mut workspace_classes: HashMap<i32, Vec<String>> = HashMap::new();
+    if collect_classes {
+        for win in niri.windows.windows.values() {
+            if let Some(ws_id) = win.workspace_id
+                && let Some(ws) = niri.workspaces.workspaces.get(&ws_id)
+                && let Some(app_id) = &win.app_id
+            {
+                workspace_classes
+                    .entry(ws.idx as i32)
+                    .or_default()
+                    .push(app_id.clone());
+            }
+        }
+    }
+
     let mut workspaces: Vec<CompositorWorkspace> = niri
         .workspaces
         .workspaces
         .values()
         .sorted_by_key(|w| w.idx)
         .map(|w| {
+            let idx = w.idx as i32;
             CompositorWorkspace {
                 id: w.id as i32,
-                index: w.idx as i32,
+                index: idx,
                 name: w.name.clone().unwrap_or_else(|| w.idx.to_string()),
                 monitor: w.output.clone().unwrap_or_default(),
                 // niri does not have an output index
@@ -202,6 +270,11 @@ fn map_state(niri: &EventStreamState) -> CompositorState {
                 windows: 0,
                 is_special: false,
                 has_urgent: w.is_urgent,
+                window_classes: if collect_classes {
+                    workspace_classes.remove(&idx).unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
             }
         })
         .collect();
@@ -233,12 +306,14 @@ fn map_state(niri: &EventStreamState) -> CompositorState {
         })
         .collect();
 
-    let active_workspace_id = niri
+    let active_workspace_ids = niri
         .workspaces
         .workspaces
         .values()
         .find(|w| w.is_focused)
-        .map(|w| w.id as i32);
+        .map(|w| w.id as i32)
+        .into_iter()
+        .collect();
 
     let active_window = niri
         .windows
@@ -266,7 +341,7 @@ fn map_state(niri: &EventStreamState) -> CompositorState {
     CompositorState {
         workspaces,
         monitors,
-        active_workspace_id,
+        active_workspace_ids,
         active_window,
         keyboard_layout,
         submap: None,

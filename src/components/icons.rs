@@ -17,7 +17,7 @@ pub trait Icon {
     fn to_text_mono<'a>(self) -> Text<'a>;
 }
 
-#[derive(Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone, Default)]
 #[allow(dead_code)]
 pub enum StaticIcon {
     #[default]
@@ -59,6 +59,8 @@ pub enum StaticIcon {
     Battery4,
     BatteryCharging,
     BatteryLimit,
+    BatteryHealth,
+    BatteryCycles,
     BatteryLimitQuickSetting,
     Wifi0,
     Wifi1,
@@ -99,6 +101,7 @@ pub enum StaticIcon {
     Pause,
     SkipNext,
     MusicNote,
+    OpenWindow,
     Drive,
     IpAddress,
     DownloadSpeed,
@@ -113,6 +116,8 @@ pub enum StaticIcon {
     KeyboardBatteryLow,
     KeyboardBatteryAlert,
     KeyboardBatteryCharging,
+    KeyboardBacklightOn,
+    KeyboardBacklightOff,
     MouseBatteryFull,
     MouseBatteryMedium,
     MouseBatteryLow,
@@ -131,7 +136,9 @@ pub enum StaticIcon {
     Remove,
     Bell,
     BellBadge,
+    BellOff,
     Delete,
+    QrCode,
 }
 
 impl StaticIcon {
@@ -175,6 +182,8 @@ impl StaticIcon {
             StaticIcon::Battery4 => "\u{f0079}",
             StaticIcon::BatteryCharging => "\u{f0084}",
             StaticIcon::BatteryLimit => "\u{f1211}",
+            StaticIcon::BatteryHealth => "\u{f05f6}",
+            StaticIcon::BatteryCycles => "\u{f1834}",
             StaticIcon::BatteryLimitQuickSetting => "\u{f120f}",
             StaticIcon::Wifi0 => "\u{f092d}",
             StaticIcon::Wifi1 => "\u{f092f}",
@@ -215,6 +224,7 @@ impl StaticIcon {
             StaticIcon::Pause => "\u{f03e4}",
             StaticIcon::SkipNext => "\u{f04ad}",
             StaticIcon::MusicNote => "\u{f0387}",
+            StaticIcon::OpenWindow => "\u{f0496}",
             StaticIcon::Drive => "\u{f02ca}",
             StaticIcon::IpAddress => "\u{f0a60}",
             StaticIcon::DownloadSpeed => "\u{f06f4}",
@@ -239,6 +249,8 @@ impl StaticIcon {
             StaticIcon::HeadphoneBatteryLow => "\u{c000c}",
             StaticIcon::HeadphoneBatteryAlert => "\u{c000d}",
             StaticIcon::HeadphoneBatteryCharging => "\u{c000e}",
+            StaticIcon::KeyboardBacklightOn => "\u{c000f}",
+            StaticIcon::KeyboardBacklightOff => "\u{c0010}",
             StaticIcon::GamepadBatteryFull => "\u{f074d}",
             StaticIcon::GamepadBatteryMedium => "\u{f074f}",
             StaticIcon::GamepadBatteryLow => "\u{f074e}",
@@ -247,11 +259,13 @@ impl StaticIcon {
             StaticIcon::Remove => "\u{f0377}",
             StaticIcon::Bell => "\u{eaa2}",
             StaticIcon::BellBadge => "\u{eb9a}",
+            StaticIcon::BellOff => "\u{ec08}",
             StaticIcon::Delete => "\u{f01b4}",
+            StaticIcon::QrCode => "\u{f0432}",
         }
     }
 
-    fn is_custom_battery_icon(&self) -> bool {
+    fn is_custom_icon(&self) -> bool {
         matches!(
             self,
             StaticIcon::KeyboardBatteryFull
@@ -269,11 +283,13 @@ impl StaticIcon {
                 | StaticIcon::HeadphoneBatteryLow
                 | StaticIcon::HeadphoneBatteryAlert
                 | StaticIcon::HeadphoneBatteryCharging
+                | StaticIcon::KeyboardBacklightOn
+                | StaticIcon::KeyboardBacklightOff
         )
     }
 
     fn get_font(&self) -> &'static str {
-        if self.is_custom_battery_icon() {
+        if self.is_custom_icon() {
             "Ashell Custom Icon"
         } else {
             "Symbols Nerd Font"
@@ -281,7 +297,7 @@ impl StaticIcon {
     }
 
     fn get_font_mono(&self) -> &'static str {
-        if self.is_custom_battery_icon() {
+        if self.is_custom_icon() {
             "Ashell Custom Icon"
         } else {
             "Symbols Nerd Font Mono"

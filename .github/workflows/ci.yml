@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dorny/paths-filter@v4
         id: filter
@@ -27,6 +27,7 @@ jobs:
           filters: |
             code:
               - 'src/**'
+              - 'crates/**'
               - 'assets/**'
               - 'build.rs'
               - 'Cargo.toml'
@@ -42,6 +43,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         if: steps.filter.outputs.code == 'true'
+        with:
+          # save only on main so PRs restore the shared cache
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
         if: steps.filter.outputs.code == 'true'
@@ -49,7 +53,11 @@ jobs:
 
       - name: Clippy
         if: steps.filter.outputs.code == 'true'
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy --workspace --all-features -- -D warnings
+
+      - name: Test ashell-services
+        if: steps.filter.outputs.code == 'true'
+        run: cargo test -p ashell-services --all-features
 
       - name: Build
         if: steps.filter.outputs.code == 'true'

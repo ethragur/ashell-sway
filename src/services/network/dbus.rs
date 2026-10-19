@@ -1,14 +1,13 @@
-use crate::services::{
-    bluetooth::BluetoothService,
-    network::{NetworkBackend, NetworkData, NetworkEvent},
+use crate::services::network::{
+    NetworkBackend, NetworkData, NetworkEvent, PskOutcome, WifiSecurity,
 };
+use ashell_services::rfkill;
 
 use super::{AccessPointData, ActiveConnectionInfo, KnownConnection, Vpn};
 use iced::futures::{Stream, StreamExt, stream::select_all};
 use itertools::Itertools;
 use log::{debug, warn};
 use std::{collections::HashMap, ops::Deref};
-use tokio::process::Command;
 use zbus::{
     Result, proxy,
     zvariant::{self, ObjectPath, OwnedObjectPath, OwnedValue, Value},
@@ -21,9 +20,7 @@ impl super::NetworkBackend for NetworkDbus<'_> {
         let nm = self;
 
         // airplane mode
-        let bluetooth_soft_blocked = BluetoothService::check_rfkill_soft_block()
-            .await
-            .unwrap_or_default();
+        let bluetooth_soft_blocked = rfkill::bluetooth_soft_blocked().await.unwrap_or_default();
 
         let wifi_present = nm.wifi_device_present().await?;
 
@@ -57,13 +54,7 @@ impl super::NetworkBackend for NetworkDbus<'_> {
     }
 
     async fn set_airplane_mode(&self, enable: bool) -> anyhow::Result<()> {
-        let rfkill_res = Command::new("/usr/sbin/rfkill")
-            .arg(if enable { "block" } else { "unblock" })
-            .arg("bluetooth")
-            .output()
-            .await;
-
-        if let Err(e) = rfkill_res {
+        if let Err(e) = rfkill::set_bluetooth_soft_block(enable).await {
             debug!("Failed to set bluetooth rfkill: {e}");
         } else {
             debug!("Bluetooth rfkill set successfully");
@@ -89,6 +80,7 @@ impl super::NetworkBackend for NetworkDbus<'_> {
         &self,
         access_point: &AccessPointData,
         password: Option<String>,
+        connect_once: bool,
     ) -> anyhow::Result<()> {
         let settings = NetworkSettingsDbus::new(self.0.inner().connection()).await?;
         let connection = settings.find_connection(&access_point.ssid).await?;
@@ -136,17 +128,19 @@ impl super::NetworkBackend for NetworkDbus<'_> {
             if let Some(pass) = password {
                 conn_settings.insert(
                     "802-11-wireless-security",
-                    HashMap::from([
-                        ("psk", Value::Str(pass.into())),
-                        ("key-mgmt", Value::Str("wpa-psk".into())),
-                    ]),
+                    HashMap::from([("psk", Value::Str(pass.into()))]),
                 );
             }
 
-            self.add_and_activate_connection(
+            // "volatile" keeps the profile in memory only and NM deletes it on disconnect
+            let persist = if connect_once { "volatile" } else { "disk" };
+            debug!("Activating '{}' with persist={persist}", access_point.ssid);
+
+            self.add_and_activate_connection2(
                 conn_settings,
                 &access_point.device_path,
                 &access_point.path,
+                HashMap::from([("persist", Value::Str(persist.into()))]),
             )
             .await?;
         }
@@ -196,6 +190,115 @@ impl NetworkDbus<'_> {
         let nm = NetworkManagerProxy::new(conn).await?;
 
         Ok(Self(nm))
+    }
+
+    /// Reads the stored passphrase for `ssid` from the profile of the connection
+    /// currently carrying it. NetworkManager-only, so not part of
+    /// [`super::NetworkBackend`].
+    pub async fn read_psk(&self, ssid: &str) -> anyhow::Result<PskOutcome> {
+        let Some((connection_path, all_settings)) = self.active_wifi_profile(ssid).await? else {
+            // Only offered for the active connection: no profile means we can't
+            // tell whether the network is open.
+            debug!("read_psk: no active connection profile for SSID '{ssid}'");
+            return Ok(PskOutcome::PasswordUnavailable);
+        };
+
+        let connection = ConnectionSettingsProxy::builder(self.0.inner().connection())
+            .path(connection_path)?
+            .build()
+            .await?;
+
+        let hidden = all_settings
+            .get("802-11-wireless")
+            .and_then(|w| w.get("hidden"))
+            .and_then(|v| match v.deref() {
+                Value::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false);
+
+        // Open networks have no security section, and GetSecrets errors on a missing one.
+        let Some(security_settings) = all_settings.get("802-11-wireless-security") else {
+            return Ok(PskOutcome::Open { hidden });
+        };
+
+        let key_mgmt = security_settings
+            .get("key-mgmt")
+            .and_then(|v| match v.deref() {
+                Value::Str(s) => Some(s.to_string()),
+                _ => None,
+            });
+
+        // 802.1X, OWE and static WEP have no PSK a `WIFI:` URI can carry.
+        let security = match key_mgmt.as_deref() {
+            Some("wpa-psk") | Some("wpa-psk-sha256") => WifiSecurity::Wpa,
+            Some("sae") => WifiSecurity::Sae,
+            _ => return Ok(PskOutcome::Unsupported),
+        };
+
+        let secrets = connection
+            .get_secrets("802-11-wireless-security")
+            .await
+            .map_err(|e| anyhow::anyhow!("polkit/secret retrieval denied for '{ssid}': {e}"))?;
+
+        let psk = secrets
+            .get("802-11-wireless-security")
+            .and_then(|sec| sec.get("psk"))
+            .and_then(|v| match v.deref() {
+                Value::Str(v) => Some(v.to_string()),
+                _ => None,
+            });
+
+        Ok(match psk {
+            Some(psk) if !psk.is_empty() => PskOutcome::Password {
+                psk,
+                security,
+                hidden,
+            },
+            // Secured, but the secret is agent-owned or flagged not-saved.
+            _ => PskOutcome::PasswordUnavailable,
+        })
+    }
+
+    /// Settings profile behind the active connection carrying `ssid`.
+    ///
+    /// Starts from the active connection's own settings profile (its
+    /// `Connection` property) instead of scanning saved profiles, so a stale
+    /// profile that shares the SSID can't provide the password.
+    async fn active_wifi_profile(
+        &self,
+        ssid: &str,
+    ) -> anyhow::Result<Option<(OwnedObjectPath, ConnectionSettingsMap)>> {
+        for active_path in self.active_connections().await? {
+            let active = ActiveConnectionProxy::builder(self.0.inner().connection())
+                .path(active_path)?
+                .build()
+                .await?;
+
+            if active.connection_type().await.ok().as_deref() != Some("802-11-wireless") {
+                continue;
+            }
+
+            let Ok(profile_path) = active.connection().await else {
+                continue;
+            };
+
+            let profile = ConnectionSettingsProxy::builder(self.0.inner().connection())
+                .path(profile_path.clone())?
+                .build()
+                .await?;
+
+            let Ok(settings) = profile.get_settings().await else {
+                warn!("active_wifi_profile: failed to get settings for {profile_path}");
+                continue;
+            };
+
+            if connection_ssid(&settings).as_deref() == Some(ssid) {
+                return Ok(Some((profile_path, settings)));
+            }
+        }
+
+        Ok(None)
     }
 
     pub async fn scan_nearby_wifi_with_devices(&self) -> anyhow::Result<Vec<OwnedObjectPath>> {
@@ -544,10 +647,12 @@ impl NetworkDbus<'_> {
                                     .build()
                                     .await?;
 
+                            let freq = access_point.frequency().await.unwrap_or_default();
                             info.push(ActiveConnectionInfo::WiFi {
                                 name: String::from_utf8_lossy(&access_point.ssid().await?)
                                     .into_owned(),
                                 strength: access_point.strength().await.unwrap_or_default(),
+                                frequency: freq,
                             });
                         }
                     }
@@ -575,6 +680,23 @@ impl NetworkDbus<'_> {
 
         Ok(info)
     }
+}
+
+type ConnectionSettingsMap = HashMap<String, HashMap<String, OwnedValue>>;
+
+fn connection_ssid(settings: &ConnectionSettingsMap) -> Option<String> {
+    let bytes: Vec<u8> = match settings.get("802-11-wireless")?.get("ssid")?.deref() {
+        Value::Array(bytes) => bytes
+            .iter()
+            .map(|b| match b {
+                Value::U8(b) => Some(*b),
+                _ => None,
+            })
+            .collect::<Option<Vec<u8>>>()?,
+        _ => return None,
+    };
+
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn connection_id(settings: &HashMap<String, HashMap<String, OwnedValue>>) -> Option<String> {
@@ -956,12 +1078,20 @@ pub trait NetworkManager {
         specific_object: OwnedObjectPath,
     ) -> Result<OwnedObjectPath>;
 
-    fn add_and_activate_connection(
+    /// Supersedes `AddAndActivateConnection` with an options dictionary
+    /// (`persist`, `bind-activation`). Requires NetworkManager 1.16 or newer.
+    #[zbus(name = "AddAndActivateConnection2")]
+    fn add_and_activate_connection2(
         &self,
         connection: HashMap<&str, HashMap<&str, Value<'_>>>,
         device: &ObjectPath<'_>,
         specific_object: &ObjectPath<'_>,
-    ) -> Result<(OwnedObjectPath, OwnedObjectPath)>;
+        options: HashMap<&str, Value<'_>>,
+    ) -> Result<(
+        OwnedObjectPath,
+        OwnedObjectPath,
+        HashMap<String, OwnedValue>,
+    )>;
 
     fn deactivate_connection(&self, connection: OwnedObjectPath) -> Result<()>;
 
@@ -992,6 +1122,9 @@ trait ActiveConnection {
 
     #[zbus(property)]
     fn uuid(&self) -> Result<String>;
+
+    #[zbus(property)]
+    fn connection(&self) -> Result<OwnedObjectPath>;
 
     #[zbus(property, name = "Type")]
     fn connection_type(&self) -> Result<String>;
@@ -1096,4 +1229,10 @@ trait ConnectionSettings {
     fn update(&self, settings: HashMap<String, HashMap<String, OwnedValue>>) -> Result<()>;
 
     fn get_settings(&self) -> Result<HashMap<String, HashMap<String, OwnedValue>>>;
+
+    /// Gated by polkit rather than `*-flags`, so it returns secrets even when `psk-flags` is set.
+    fn get_secrets(
+        &self,
+        setting_name: &str,
+    ) -> Result<HashMap<String, HashMap<String, OwnedValue>>>;
 }

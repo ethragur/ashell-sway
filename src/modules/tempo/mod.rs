@@ -23,6 +23,57 @@ use crate::{
 
 pub use self::weather::weather_icon;
 
+/// Specifiers whose output changes at least once per second, so a format
+/// containing any of them has to be refreshed every second.
+const SECOND_SPECIFIERS: [&str; 15] = [
+    "%S",  // seconds
+    "%T",  // %H:%M:%S
+    "%X",  // locale time representation, with seconds
+    "%r",  // 12-hour clock time, with seconds
+    "%c",  // locale date and time, with seconds
+    "%+",  // ISO 8601 / RFC 3339, with seconds
+    "%s",  // seconds since epoch
+    "%f",  // nanoseconds, also covers ".%f"
+    "%.f", // nanoseconds, left aligned
+    "%3f", // milliseconds
+    "%6f", // microseconds
+    "%9f", // nanoseconds
+    "%.3f", "%.6f", "%.9f", // the left aligned fractional variants
+];
+
+fn shows_seconds(format: &str) -> bool {
+    let mut rest = format;
+
+    while let Some(percent) = rest.find('%') {
+        let after = &rest[percent + 1..];
+
+        // `%%` is a literal percent sign, not the start of a specifier.
+        if let Some(literal) = after.strip_prefix('%') {
+            rest = literal;
+            continue;
+        }
+
+        // skip padding flags
+        let specifier = after.trim_start_matches(['-', '_', '0']);
+
+        if SECOND_SPECIFIERS
+            .iter()
+            .any(|candidate| specifier.starts_with(&candidate[1..]))
+        {
+            return true;
+        }
+
+        rest = specifier;
+    }
+
+    false
+}
+
+/// Local wall-clock minute, so a system time zone change also triggers a redraw.
+fn local_minute(now: DateTime<Local>) -> i64 {
+    now.naive_local().and_utc().timestamp().div_euclid(60)
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Update,
@@ -220,34 +271,26 @@ impl Tempo {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let second_specifiers = [
-            "%S",  // Seconds (00-60)
-            "%T",  // Hour:Minute:Second
-            "%X",  // Locale time representation with seconds
-            "%r",  // 12-hour clock time with seconds
-            "%:z", // UTC offset with seconds
-            "%s",  // Seconds since epoch
-        ];
+        let shows_seconds = shows_seconds(self.current_format());
 
-        let current_format = self.current_format();
-
-        let interval = if second_specifiers
-            .iter()
-            .any(|&spec| current_format.contains(spec))
-        {
-            Duration::from_secs(1)
-        } else {
-            Duration::from_secs(5)
-        };
-
-        let time_sub = Subscription::run_with(interval, |interval| {
-            let interval = *interval;
+        let time_sub = Subscription::run_with(shows_seconds, |&shows_seconds| {
             channel(
                 100,
                 async move |mut output: iced::futures::channel::mpsc::Sender<Message>| {
-                    let mut interval = tokio::time::interval(interval);
+                    let period = if shows_seconds { 1 } else { 5 };
+                    let mut interval = tokio::time::interval(Duration::from_secs(period));
+                    let mut last_minute = None;
                     loop {
                         interval.tick().await;
+
+                        if !shows_seconds {
+                            let minute = local_minute(Local::now());
+                            if last_minute == Some(minute) {
+                                continue;
+                            }
+                            last_minute = Some(minute);
+                        }
+
                         output.send(Message::Update).await.ok();
                     }
                 },

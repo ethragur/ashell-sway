@@ -5,11 +5,12 @@ use crate::{
         ButtonHierarchy, ButtonKind, ButtonUIRef, IconPosition, MenuSize, position_button,
         styled_button,
     },
+    components::{scrollable, toggler},
     config::{TrayClickAction, TrayModuleConfig},
     services::{
         ReadOnlyService, Service, ServiceEvent,
         tray::{
-            TrayCommand, TrayEvent, TrayIcon, TrayService,
+            ItemStatus, StatusNotifierItem, TrayCommand, TrayEvent, TrayIcon, TrayService,
             dbus::{Layout, LayoutProps},
         },
     },
@@ -17,11 +18,37 @@ use crate::{
 };
 use iced::{
     Alignment, Element, Length, Padding, Subscription, SurfaceId, Task,
-    widget::{Column, Image, Row, Svg, container, scrollable, text, toggler},
+    widget::{Column, Image, Row, Svg, container, text},
 };
 use log::debug;
 
 const MENU_MAX_HEIGHT: f32 = 600.;
+
+fn is_separator(layout: &Layout) -> bool {
+    layout.1.type_.as_deref() == Some("separator")
+}
+
+fn is_visible(layout: &Layout) -> bool {
+    layout.1.visible != Some(false)
+}
+
+fn renderable_children(children: &[Layout]) -> impl Iterator<Item = &Layout> {
+    let end = children
+        .iter()
+        .rposition(|child| is_visible(child) && !is_separator(child))
+        .map_or(0, |last| last + 1);
+
+    children[..end]
+        .iter()
+        .filter(|child| is_visible(child))
+        .scan(true, |prev_sep, child| {
+            let sep = is_separator(child);
+            let keep = !(sep && *prev_sep);
+            *prev_sep = sep;
+            Some(keep.then_some(child))
+        })
+        .flatten()
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -32,6 +59,7 @@ pub enum Message {
     MenuToggled(String, i32),
     MenuOpened(String),
     Activate(String),
+    ConfigReloaded(TrayModuleConfig),
 }
 
 pub enum Action {
@@ -62,6 +90,14 @@ impl TrayModule {
 
     fn is_blocklisted(&self, name: &str) -> bool {
         self.blocklist.iter().any(|pattern| pattern.is_match(name))
+    }
+
+    /// Visible unless blocklisted; `Passive` items are hidden per the spec.
+    fn is_visible(&self, item: &StatusNotifierItem) -> bool {
+        if self.is_blocklisted(&item.name) {
+            return false;
+        }
+        item.status != ItemStatus::Passive
     }
 
     pub fn update(&mut self, message: Message) -> Action {
@@ -142,6 +178,11 @@ impl TrayModule {
                 }
                 _ => Action::None,
             },
+            Message::ConfigReloaded(config) => {
+                self.blocklist = config.blocklist;
+                self.right_click = config.right_click;
+                Action::None
+            }
         }
     }
 
@@ -209,12 +250,8 @@ impl TrayModule {
                     .push(if is_open {
                         Some(
                             Column::with_children(
-                                layout
-                                    .2
-                                    .iter()
-                                    .filter(|menu| menu.1.visible != Some(false))
-                                    .map(|menu| self.menu_voice(name, menu))
-                                    .collect::<Vec<_>>(),
+                                renderable_children(&layout.2)
+                                    .map(|menu| self.menu_voice(name, menu)),
                             )
                             .padding(Padding::default().left(space.md))
                             .spacing(space.xxs),
@@ -247,18 +284,23 @@ impl TrayModule {
 
         self.service
             .as_ref()
-            .filter(|s| !s.data.is_empty())
+            .filter(|s| s.data.iter().any(|item| self.is_visible(item)))
             .map(|service| {
                 Into::<Element<_>>::into(
                     Row::with_children(
                         service
                             .data
                             .iter()
-                            .filter(|item| !self.is_blocklisted(&item.name))
+                            .filter(|item| self.is_visible(item))
                             .map(|item| {
                                 let name = item.name.to_owned();
                                 let button_style = button_style.clone();
-                                let icon_content: Element<'_, Message> = match &item.icon {
+                                let active_icon = if item.status == ItemStatus::NeedsAttention {
+                                    item.attention_icon.as_ref().or(item.icon.as_ref())
+                                } else {
+                                    item.icon.as_ref()
+                                };
+                                let icon_content: Element<'_, Message> = match active_icon {
                                     Some(TrayIcon::Image(handle)) => Image::new(handle.clone())
                                         .height(Length::Fixed(font_size.md - 2.0))
                                         .into(),
@@ -288,6 +330,7 @@ impl TrayModule {
                             })
                             .collect::<Vec<_>>(),
                     )
+                    .padding([2.0, 0.])
                     .align_y(Alignment::Center),
                 )
             })
@@ -301,11 +344,7 @@ impl TrayModule {
             .and_then(|service| service.data.iter().find(|item| item.name == name))
         {
             Some(item) => Column::with_children(
-                item.menu
-                    .2
-                    .iter()
-                    .filter(|menu| menu.1.visible != Some(false))
-                    .map(|menu| self.menu_voice(name, menu)),
+                renderable_children(&item.menu.2).map(|menu| self.menu_voice(name, menu)),
             )
             .spacing(space.xs),
             _ => Column::new(),
@@ -319,5 +358,136 @@ impl TrayModule {
 
     pub fn subscription(&self) -> Subscription<Message> {
         TrayService::subscribe().map(|e| Message::Event(Box::new(e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TrayModule, is_separator, is_visible, renderable_children};
+    use crate::config::{RegexCfg, TrayModuleConfig};
+    use crate::services::tray::dbus::{Layout, LayoutProps};
+
+    fn make_layout(id: i32, type_: Option<&str>, visible: Option<bool>) -> Layout {
+        Layout(
+            id,
+            LayoutProps {
+                children_display: None,
+                label: None,
+                type_: type_.map(|t| t.to_string()),
+                toggle_type: None,
+                toggle_state: None,
+                visible,
+            },
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn is_separator_detects_separator_type() {
+        let layout = make_layout(1, Some("separator"), Some(true));
+        assert!(is_separator(&layout));
+    }
+
+    #[test]
+    fn is_separator_rejects_normal_item() {
+        let layout = make_layout(1, None, Some(true));
+        assert!(!is_separator(&layout));
+    }
+
+    #[test]
+    fn is_visible_treats_none_as_visible() {
+        let layout = make_layout(1, None, None);
+        assert!(is_visible(&layout));
+    }
+
+    #[test]
+    fn is_visible_respects_explicit_false() {
+        let layout = make_layout(1, None, Some(false));
+        assert!(!is_visible(&layout));
+    }
+
+    #[test]
+    fn is_visible_respects_explicit_true() {
+        let layout = make_layout(1, None, Some(true));
+        assert!(is_visible(&layout));
+    }
+
+    #[test]
+    fn renderable_children_drops_trailing_separator_and_invisible() {
+        let children = vec![
+            make_layout(1, Some("separator"), Some(true)),
+            make_layout(2, None, Some(true)),
+            make_layout(3, Some("separator"), Some(true)),
+        ];
+        let rendered: Vec<_> = renderable_children(&children).collect();
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].0, 2);
+    }
+
+    #[test]
+    fn renderable_children_collapses_consecutive_separators() {
+        let children = vec![
+            make_layout(1, None, Some(true)),
+            make_layout(2, Some("separator"), Some(true)),
+            make_layout(3, Some("separator"), Some(true)),
+            make_layout(4, None, Some(true)),
+        ];
+        let rendered: Vec<_> = renderable_children(&children).collect();
+        assert_eq!(rendered.len(), 3);
+        assert_eq!(rendered[0].0, 1);
+        assert_eq!(rendered[1].0, 2);
+        assert_eq!(rendered[2].0, 4);
+    }
+
+    #[test]
+    fn renderable_children_drops_invisible_items() {
+        let children = vec![
+            make_layout(1, None, Some(true)),
+            make_layout(2, None, Some(false)),
+            make_layout(3, None, Some(true)),
+        ];
+        let rendered: Vec<_> = renderable_children(&children).collect();
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(rendered[0].0, 1);
+        assert_eq!(rendered[1].0, 3);
+    }
+
+    fn module_with_blocklist(patterns: &[&str]) -> TrayModule {
+        let config = TrayModuleConfig {
+            blocklist: patterns
+                .iter()
+                .map(|p| RegexCfg(regex::Regex::new(p).unwrap()))
+                .collect(),
+            right_click: None,
+        };
+        TrayModule::new(config)
+    }
+
+    #[test]
+    fn is_blocklisted_matches_regex_pattern() {
+        let module = module_with_blocklist(&["^telegram"]);
+        assert!(module.is_blocklisted("telegram"));
+        assert!(!module.is_blocklisted("nextcloud"));
+    }
+
+    #[test]
+    fn is_blocklisted_matches_partial_pattern() {
+        let module = module_with_blocklist(&["blueman"]);
+        assert!(module.is_blocklisted("org.blueman.sni"));
+        assert!(!module.is_blocklisted("telegram"));
+    }
+
+    #[test]
+    fn is_blocklisted_empty_blocklist_matches_nothing() {
+        let module = module_with_blocklist(&[]);
+        assert!(!module.is_blocklisted("anything"));
+    }
+
+    #[test]
+    fn is_blocklisted_multiple_patterns_any_match() {
+        let module = module_with_blocklist(&["telegram", "nextcloud"]);
+        assert!(module.is_blocklisted("nextcloud"));
+        assert!(module.is_blocklisted("telegram"));
+        assert!(!module.is_blocklisted("blueman"));
     }
 }

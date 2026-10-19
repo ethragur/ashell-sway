@@ -1,4 +1,4 @@
-use crate::services::{ReadOnlyService, ServiceEvent};
+use crate::services::{ReadOnlyService, ServiceEvent, xdg_icons};
 use iced::Subscription;
 use iced::futures::{SinkExt, StreamExt, channel::mpsc::Sender, stream::pending};
 use iced::stream::channel;
@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
-use zbus::Connection;
 use zbus::zvariant::OwnedValue;
+use zbus::{Connection, zvariant};
 
 pub mod dbus;
 
@@ -29,9 +29,11 @@ impl NotificationIcon {
         app_icon: &str,
         hints: &HashMap<String, OwnedValue>,
     ) -> Option<Self> {
-        icon_candidates(app_name, app_icon, hints)
-            .find_map(resolve_candidate)
-            .map(Self::from_path)
+        try_icon_from_hints(hints).or_else(|| {
+            icon_candidates(app_name, app_icon, hints)
+                .find_map(resolve_candidate)
+                .map(Self::from_path)
+        })
     }
 
     fn from_path(path: PathBuf) -> Self {
@@ -44,6 +46,53 @@ impl NotificationIcon {
         } else {
             Self::Image(image::Handle::from_path(path))
         }
+    }
+}
+
+// freedesktop notification hint image data type
+#[derive(zvariant::OwnedValue, Debug)]
+struct HintImageData {
+    width: i32,
+    height: i32,
+    rowstride: i32,
+    has_alpha: bool,
+    bits_per_sample: i32,
+    channels: i32,
+    image_bytes: Vec<u8>,
+}
+
+fn try_icon_from_hints(hints: &HashMap<String, OwnedValue>) -> Option<NotificationIcon> {
+    if let Some(image_data) = hints
+        .get("image-data")
+        .or(hints.get("image_data"))
+        .or(hints.get("icon_data"))
+        && let Ok(hint_image_data) = HintImageData::try_from(image_data.clone())
+        && let Some(bytes) = if hint_image_data.has_alpha && hint_image_data.channels == 4 {
+            Some(hint_image_data.image_bytes)
+        } else if !hint_image_data.has_alpha && hint_image_data.channels == 3 {
+            Some(
+                hint_image_data
+                    .image_bytes
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .flat_map(|[r, g, b]| [*r, *g, *b, 255_u8])
+                    .collect(),
+            )
+        } else {
+            None
+        }
+        && bytes.len() == (hint_image_data.width * hint_image_data.height * 4) as usize
+    {
+        Some(NotificationIcon::Image(
+            iced::advanced::image::Handle::from_rgba(
+                hint_image_data.width as u32,
+                hint_image_data.height as u32,
+                bytes,
+            ),
+        ))
+    } else {
+        None
     }
 }
 
@@ -91,9 +140,9 @@ fn resolve_candidate(candidate: String) -> Option<PathBuf> {
 
 fn freedesktop_lookup(name: &str) -> Option<PathBuf> {
     let base = freedesktop_icons::lookup(name).with_cache();
-    match linicon_theme::get_icon_theme() {
+    match xdg_icons::icon_theme() {
         Some(theme) => base
-            .with_theme(&theme)
+            .with_theme(theme)
             .find()
             .or_else(|| freedesktop_icons::lookup(name).with_cache().find()),
         None => base.find(),

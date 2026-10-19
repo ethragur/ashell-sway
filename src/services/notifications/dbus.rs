@@ -7,6 +7,7 @@ use zbus::{
     Connection,
     fdo::{DBusProxy, RequestNameFlags, RequestNameReply},
     interface,
+    message::Header,
     names::WellKnownName,
     zvariant::OwnedValue,
 };
@@ -15,6 +16,15 @@ use zbus::{
 pub enum NotificationEvent {
     Received(Box<Notification>),
     Closed(u32),
+}
+
+/// Which instance of an id a close applies to.
+#[derive(Debug, Clone, Copy)]
+pub enum CloseGuard {
+    /// Whatever holds the id now.
+    Any,
+    /// Only while the id still carries this revision.
+    Revision(u64),
 }
 
 const NAME: WellKnownName =
@@ -48,21 +58,61 @@ impl Urgency {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Notification {
     pub id: u32,
+    /// Bumped on every `Notify`, so a consumer can tell one instance of an id
+    /// from the next one a `replaces_id` put in its place.
+    pub revision: u64,
     pub app_name: String,
     pub app_icon: String,
     pub summary: String,
     pub body: String,
     pub actions: Vec<String>,
-    pub hints: HashMap<String, OwnedValue>,
+    /// Kept instead of all hints, which can carry raw `image-data`.
+    #[serde(default)]
+    pub desktop_entry: Option<String>,
     pub expire_timeout: i32,
     pub timestamp: SystemTime,
     pub urgency: Urgency,
+    /// Unique name of the D-Bus connection that sent the notification, whose
+    /// pid finds the sender's window on click. For sandboxed apps (Flatpak's
+    /// D-Bus proxy) or portal notifications that is not the app's own pid.
+    #[serde(default)]
+    pub sender: Option<String>,
     #[serde(skip)]
     pub icon: Option<NotificationIcon>,
 }
 
+pub const DEFAULT_ACTION_KEY: &str = "default";
+
+impl Notification {
+    /// `(key, label)` pairs from the flat `[key, label, ...]` action list.
+    pub fn action_pairs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.actions
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[key, label]| (key.as_str(), label.as_str()))
+    }
+
+    /// App ids or window classes the sender's windows likely carry: the
+    /// `desktop-entry` hint (without `.desktop`), then the app name.
+    pub fn app_ids(&self) -> Vec<String> {
+        self.desktop_entry
+            .iter()
+            .cloned()
+            .chain(std::iter::once(self.app_name.clone()))
+            .map(|id| {
+                let id = id.trim();
+                id.strip_suffix(".desktop").unwrap_or(id).to_string()
+            })
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+}
+
 pub struct NotificationDaemon {
     next_id: u32,
+    next_revision: u64,
+    revisions: HashMap<u32, u64>,
     event_tx: broadcast::Sender<NotificationEvent>,
     connection: Connection,
 }
@@ -71,6 +121,8 @@ impl NotificationDaemon {
     pub fn new(event_tx: broadcast::Sender<NotificationEvent>, connection: Connection) -> Self {
         Self {
             next_id: 0,
+            next_revision: 0,
+            revisions: HashMap::new(),
             event_tx,
             connection,
         }
@@ -99,27 +151,38 @@ impl NotificationDaemon {
         actions: Vec<String>,
         hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
+        #[zbus(header)] header: Header<'_>,
     ) -> u32 {
         let id = if replaces_id == 0 {
-            self.next_id += 1;
+            self.next_id = self.next_id.checked_add(1).unwrap_or(1);
             self.next_id
         } else {
+            self.next_id = self.next_id.max(replaces_id);
             replaces_id
         };
 
+        self.next_revision += 1;
+        let revision = self.next_revision;
+        self.revisions.insert(id, revision);
+
         let icon = NotificationIcon::resolve(&app_name, &app_icon, &hints);
         let urgency = Urgency::from_hints(&hints);
+        let desktop_entry = hints
+            .get("desktop-entry")
+            .and_then(|v| String::try_from(v.clone()).ok());
         let notification = Notification {
             id,
+            revision,
             app_name,
             app_icon,
             summary,
             body,
             actions,
-            hints,
+            desktop_entry,
             expire_timeout,
             timestamp: SystemTime::now(),
             urgency,
+            sender: header.sender().map(|sender| sender.to_string()),
             icon,
         };
 
@@ -134,20 +197,7 @@ impl NotificationDaemon {
     }
 
     async fn close_notification(&mut self, id: u32) {
-        // Send event through channel
-        let _ = self.event_tx.send(NotificationEvent::Closed(id));
-
-        // Emit DBus signal for external applications
-        let _ = self
-            .connection
-            .emit_signal(
-                None::<&str>,
-                OBJECT_PATH,
-                NAME.as_str(),
-                "NotificationClosed",
-                &(id, 3u32),
-            )
-            .await;
+        self.close_with_reason(id, 3).await;
     }
 
     async fn get_server_information(&self) -> (String, String, String, String) {
@@ -187,32 +237,120 @@ impl NotificationDaemon {
         Ok((connection, event_tx))
     }
 
-    pub async fn invoke_action(
+    /// `guard` pins the instance the caller acted on: both steps are skipped
+    /// when `id` no longer carries it, because a `Notify` won the race against
+    /// this call and the notification the user acted on is gone. Closing anyway
+    /// would take the replacement down with it. Holding the interface lock over
+    /// the check and both steps is what keeps that ordering decidable.
+    ///
+    /// Returns whether `id` was closed, false when it was replaced since.
+    pub async fn invoke_and_close(
         connection: &Connection,
         id: u32,
-        action_key: String,
-    ) -> anyhow::Result<()> {
-        connection
-            .emit_signal(
-                None::<&str>,
-                OBJECT_PATH,
-                NAME.as_str(),
-                "ActionInvoked",
-                &(id, action_key),
-            )
-            .await?;
-        Ok(())
-    }
-
-    pub async fn close_notification_by_id(connection: &Connection, id: u32) -> anyhow::Result<()> {
-        // Get the object server interface to call the method properly
+        action_key: Option<String>,
+        guard: CloseGuard,
+    ) -> anyhow::Result<bool> {
         let iface_ref = connection
             .object_server()
             .interface::<_, NotificationDaemon>(OBJECT_PATH)
             .await?;
+        let mut daemon = iface_ref.get_mut().await;
 
-        // Call the close_notification method which properly cleans up and emits events
-        iface_ref.get_mut().await.close_notification(id).await;
+        if let CloseGuard::Revision(revision) = guard
+            && daemon.revisions.get(&id) != Some(&revision)
+        {
+            debug!("Skipping close of notification {}: replaced since", id);
+            return Ok(false);
+        }
+
+        if let Some(action_key) = action_key {
+            connection
+                .emit_signal(
+                    None::<&str>,
+                    OBJECT_PATH,
+                    NAME.as_str(),
+                    "ActionInvoked",
+                    &(id, action_key),
+                )
+                .await?;
+        }
+
+        daemon.close_with_reason(id, 2).await;
+        Ok(true)
+    }
+
+    /// `reason` per the freedesktop Notifications spec: 1 expired,
+    /// 2 dismissed by the user, 3 closed by `CloseNotification`.
+    async fn close_with_reason(&mut self, id: u32, reason: u32) {
+        self.revisions.remove(&id);
+
+        let _ = self.event_tx.send(NotificationEvent::Closed(id));
+
+        let _ = self
+            .connection
+            .emit_signal(
+                None::<&str>,
+                OBJECT_PATH,
+                NAME.as_str(),
+                "NotificationClosed",
+                &(id, reason),
+            )
+            .await;
+    }
+
+    /// Skips ids replaced since, like [`Self::invoke_and_close`].
+    pub async fn evict_notifications(
+        connection: &Connection,
+        evicted: &[(u32, u64)],
+    ) -> anyhow::Result<()> {
+        let iface_ref = connection
+            .object_server()
+            .interface::<_, NotificationDaemon>(OBJECT_PATH)
+            .await?;
+        let mut daemon = iface_ref.get_mut().await;
+
+        for (id, revision) in evicted {
+            if daemon.revisions.get(id) != Some(revision) {
+                debug!("Skipping eviction of notification {id}: replaced since");
+                continue;
+            }
+            daemon.close_with_reason(*id, 1).await;
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notification(app_name: &str, desktop_entry: Option<&str>) -> Notification {
+        Notification {
+            id: 1,
+            revision: 1,
+            app_name: app_name.to_string(),
+            app_icon: String::new(),
+            summary: String::new(),
+            body: String::new(),
+            actions: vec![],
+            desktop_entry: desktop_entry.map(str::to_string),
+            expire_timeout: -1,
+            timestamp: SystemTime::now(),
+            urgency: Urgency::Normal,
+            sender: None,
+            icon: None,
+        }
+    }
+
+    #[test]
+    fn app_ids_prefer_the_desktop_entry() {
+        let n = notification("Telegram Desktop", Some("org.telegram.desktop.desktop"));
+        assert_eq!(n.app_ids(), ["org.telegram.desktop", "Telegram Desktop"]);
+    }
+
+    #[test]
+    fn app_ids_fall_back_to_the_app_name() {
+        assert_eq!(notification("firefox", None).app_ids(), ["firefox"]);
+        assert!(notification(" ", None).app_ids().is_empty());
     }
 }

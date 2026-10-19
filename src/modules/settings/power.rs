@@ -4,65 +4,111 @@ use crate::{
     components::{
         ButtonKind, IconPosition, divider, format_indicator,
         icons::{StaticIcon, icon},
-        quick_setting_button, styled_button,
+        quick_setting_button, slider_control, styled_button,
     },
     config::{PeripheralIndicators, SettingsFormat},
     services::{
         ReadOnlyService, Service, ServiceEvent,
-        upower::{BatteryData, BatteryStatus, PowerProfile, UPowerCommand, UPowerService},
+        upower::{
+            BatteryData, BatteryHealth, BatteryStatus, PowerProfile, UPowerCommand, UPowerService,
+        },
     },
     t,
     theme::use_theme,
-    utils::{self, IndicatorState, format_duration},
+    utils::{self, IndicatorState, format_duration, remote_value},
 };
 use iced::{
-    Alignment, Element, Length, Subscription, Task, Theme,
+    Alignment, Element, Length, Subscription, SurfaceId, Task, Theme,
     alignment::Vertical,
+    mouse::ScrollDelta,
     widget::{Column, Row, column, container, row, text},
 };
 
-fn format_time_for_battery(battery: &BatteryData) -> String {
+fn health_text(health: &BatteryHealth) -> String {
+    let percentage = health.percentage().round() as i64;
+    let energy_full = health.energy_full.round() as i64;
+    let energy_full_design = health.energy_full_design.round() as i64;
+    t!(
+        "settings-power-health",
+        percentage = percentage,
+        energy_full = energy_full,
+        energy_full_design = energy_full_design
+    )
+}
+
+fn charge_cycles_text(cycles: i32) -> String {
+    t!("settings-power-charge-cycles", count = cycles)
+}
+
+/// The battery's health and, when known, its charge cycles, each with its
+/// icon. Shared by the battery tooltip and the battery menu.
+fn health_details(health: &BatteryHealth) -> Vec<(StaticIcon, String)> {
+    std::iter::once((StaticIcon::BatteryHealth, health_text(health)))
+        .chain(
+            health
+                .charge_cycles
+                .map(|cycles| (StaticIcon::BatteryCycles, charge_cycles_text(cycles))),
+        )
+        .collect()
+}
+
+/// What the system battery's tooltip shows.
+pub struct BatteryTooltipInfo {
+    pub capacity: u32,
+    pub status_label: String,
+    pub details: String,
+    /// Health and charge cycles, each with its icon.
+    pub health_lines: Vec<(StaticIcon, String)>,
+}
+
+fn battery_time(battery: &BatteryData) -> Option<String> {
     match battery.status {
-        BatteryStatus::Charging(duration) => {
-            if battery.capacity >= 100 || duration.is_zero() {
-                "100%".to_string()
-            } else {
-                format_duration(&duration)
-            }
-        }
-        BatteryStatus::Discharging(duration) => {
-            if battery.capacity >= 100 {
-                "100%".to_string()
-            } else if duration.is_zero() {
+        BatteryStatus::Charging(duration) | BatteryStatus::Discharging(duration)
+            if battery.capacity < 100 =>
+        {
+            Some(if duration.is_zero() {
                 t!("settings-power-calculating")
             } else {
                 format_duration(&duration)
-            }
+            })
         }
-        BatteryStatus::NotCharging => format!("{}%", battery.capacity),
-        BatteryStatus::Unknown => String::new(),
-        BatteryStatus::Full => "100%".to_string(),
+        _ => None,
+    }
+}
+
+fn format_time_for_battery(battery: &BatteryData) -> String {
+    battery_time(battery).unwrap_or_else(|| format!("{}%", battery.capacity))
+}
+
+fn format_percentage_and_time(battery: &BatteryData) -> String {
+    let capacity = format!("{}%", battery.capacity);
+    match battery_time(battery) {
+        Some(time) => format!("{capacity} {time}"),
+        None => capacity,
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Event(ServiceEvent<UPowerService>),
-    TogglePeripheralMenu,
+    ToggleBatteryMenu,
     TogglePowerProfile,
     ToggleChargeLimit,
-    Suspend,
-    Hibernate,
-    Reboot,
-    Shutdown,
-    Logout,
+    ToggleKbdBacklight,
+    Suspend(SurfaceId),
+    Hibernate(SurfaceId),
+    Reboot(SurfaceId),
+    Shutdown(SurfaceId),
+    Logout(SurfaceId),
+    KbdBacklightChanged(remote_value::Message<u32>),
     ConfigReloaded(PowerSettingsConfig),
 }
 
 pub enum Action {
     None,
-    TogglePeripheralMenu,
+    ToggleBatteryMenu,
     Command(Task<Message>),
+    CloseMenu(SurfaceId),
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +123,8 @@ pub struct PowerSettingsConfig {
     pub peripheral_indicators: PeripheralIndicators,
     pub peripheral_battery_format: SettingsFormat,
     pub peripheral_expanded_by_default: bool,
+    pub battery_health: bool,
+    pub keyboard_backlight_slider: bool,
 }
 
 impl PowerSettingsConfig {
@@ -92,6 +140,8 @@ impl PowerSettingsConfig {
         peripheral_indicators: PeripheralIndicators,
         peripheral_battery_format: SettingsFormat,
         peripheral_expanded_by_default: bool,
+        battery_health: bool,
+        keyboard_backlight_slider: bool,
     ) -> Self {
         Self {
             suspend_cmd,
@@ -104,6 +154,8 @@ impl PowerSettingsConfig {
             peripheral_indicators,
             peripheral_battery_format,
             peripheral_expanded_by_default,
+            battery_health,
+            keyboard_backlight_slider,
         }
     }
 }
@@ -136,7 +188,24 @@ impl PowerSettings {
                 }
                 ServiceEvent::Error(_) => Action::None,
             },
-            Message::TogglePeripheralMenu => Action::TogglePeripheralMenu,
+            Message::ToggleBatteryMenu => Action::ToggleBatteryMenu,
+            Message::ToggleKbdBacklight => {
+                if let Some(service) = self.service.as_mut()
+                    && let Some(backlight) = service.kbd_backlight.as_mut()
+                {
+                    let new_value = if backlight.current.value() == 0 {
+                        backlight.retained.unwrap_or(backlight.max)
+                    } else {
+                        backlight.retained = Some(backlight.current.value());
+                        0
+                    };
+                    self.update(Message::KbdBacklightChanged(
+                        remote_value::Message::RequestAndTimeout(new_value),
+                    ))
+                } else {
+                    Action::None
+                }
+            }
             Message::TogglePowerProfile => match self.service.as_mut() {
                 Some(service) => Action::Command(
                     service
@@ -153,26 +222,44 @@ impl PowerSettings {
                 ),
                 _ => Action::None,
             },
-            Message::Suspend => {
+            Message::Suspend(id) => {
                 utils::launcher::suspend(&self.config.suspend_cmd);
-                Action::None
+                Action::CloseMenu(id)
             }
-            Message::Hibernate => {
+            Message::Hibernate(id) => {
                 if let Some(hibernate_cmd) = &self.config.hibernate_cmd {
                     utils::launcher::hibernate(hibernate_cmd);
                 }
-                Action::None
+                Action::CloseMenu(id)
             }
-            Message::Reboot => {
+            Message::Reboot(id) => {
                 utils::launcher::reboot(&self.config.reboot_cmd);
-                Action::None
+                Action::CloseMenu(id)
             }
-            Message::Shutdown => {
+            Message::Shutdown(id) => {
                 utils::launcher::shutdown(&self.config.shutdown_cmd);
-                Action::None
+                Action::CloseMenu(id)
             }
-            Message::Logout => {
+            Message::Logout(id) => {
                 utils::launcher::logout(&self.config.logout_cmd);
+                Action::CloseMenu(id)
+            }
+            Message::KbdBacklightChanged(message) => {
+                if let Some(service) = self.service.as_mut() {
+                    // Send
+                    if let Some(value) = message.value() {
+                        let _ = service.command(UPowerCommand::SetKbdBacklight(value));
+                    }
+                    // Drive UI updates
+                    if let Some(kbd_backlight) = service.kbd_backlight.as_mut() {
+                        return Action::Command(
+                            kbd_backlight
+                                .current
+                                .update(message)
+                                .map(Message::KbdBacklightChanged),
+                        );
+                    }
+                };
                 Action::None
             }
             Message::ConfigReloaded(config) => {
@@ -182,31 +269,31 @@ impl PowerSettings {
         }
     }
 
-    pub fn menu<'a>(&'a self) -> Element<'a, Message> {
+    pub fn menu<'a>(&'a self, id: SurfaceId) -> Element<'a, Message> {
         let space = use_theme(|t| t.space);
         column!(
             styled_button(t!("settings-power-suspend"))
                 .icon(StaticIcon::Suspend, IconPosition::Before)
-                .on_press(Message::Suspend)
+                .on_press(Message::Suspend(id))
                 .width(Length::Fill),
             self.config.hibernate_cmd.as_ref().map(|_| {
                 styled_button(t!("settings-power-hibernate"))
                     .icon(StaticIcon::Hibernate, IconPosition::Before)
-                    .on_press(Message::Hibernate)
+                    .on_press(Message::Hibernate(id))
                     .width(Length::Fill)
             }),
             styled_button(t!("settings-power-reboot"))
                 .icon(StaticIcon::Reboot, IconPosition::Before)
-                .on_press(Message::Reboot)
+                .on_press(Message::Reboot(id))
                 .width(Length::Fill),
             styled_button(t!("settings-power-shutdown"))
                 .icon(StaticIcon::Power, IconPosition::Before)
-                .on_press(Message::Shutdown)
+                .on_press(Message::Shutdown(id))
                 .width(Length::Fill),
             divider(),
             styled_button(t!("settings-power-logout"))
                 .icon(StaticIcon::Logout, IconPosition::Before)
-                .on_press(Message::Logout)
+                .on_press(Message::Logout(id))
                 .width(Length::Fill),
         )
         .padding(space.xs)
@@ -215,31 +302,59 @@ impl PowerSettings {
         .into()
     }
 
-    pub fn peripheral_menu<'a>(&'a self) -> Option<Element<'a, Message>> {
+    /// The battery's health and charge cycles, unless `battery_health` hides them.
+    fn shown_health(&self, battery: &BatteryData) -> Option<BatteryHealth> {
+        battery.health.filter(|_| self.config.battery_health)
+    }
+
+    /// The system battery's health and charge cycles, then the peripheral
+    /// batteries. `None` when there is nothing to show.
+    pub fn battery_menu<'a>(&'a self) -> Option<Element<'a, Message>> {
         let space = use_theme(|t| t.space);
-        self.service
-            .as_ref()
-            .filter(|s| !s.peripherals.is_empty())
-            .map(|service| {
+        let service = self.service.as_ref()?;
+
+        let detail_row = |icon_kind: StaticIcon, label: String| -> Element<'a, Message> {
+            row![icon(icon_kind), text(label).width(Length::Fill)]
+                .align_y(Vertical::Center)
+                .spacing(space.sm)
+                .into()
+        };
+        let health = service
+            .system_battery
+            .and_then(|battery| self.shown_health(&battery))
+            .map(|health| {
                 Column::with_children(
-                    service
-                        .peripherals
-                        .iter()
-                        .map(|p| {
-                            row![
-                                icon(p.kind.get_icon()),
-                                text(p.name.to_string()).width(Length::Fill),
-                                self.menu_indicator(p.data, None, None),
-                            ]
-                            .align_y(Vertical::Center)
-                            .spacing(space.sm)
-                            .into()
-                        })
-                        .collect::<Vec<Element<Message>>>(),
+                    health_details(&health)
+                        .into_iter()
+                        .map(|(icon_kind, label)| detail_row(icon_kind, label)),
                 )
                 .spacing(space.xs)
+            });
+
+        let peripherals = (!service.peripherals.is_empty()).then(|| {
+            Column::with_children(service.peripherals.iter().map(|p| {
+                row![
+                    icon(p.kind.get_icon()),
+                    text(p.name.to_string()).width(Length::Fill),
+                    self.menu_indicator(p.data, None, None),
+                ]
+                .align_y(Vertical::Center)
+                .spacing(space.sm)
                 .into()
-            })
+            }))
+            .spacing(space.xs)
+        });
+
+        match (health, peripherals) {
+            (None, None) => None,
+            (Some(health), None) => Some(health.into()),
+            (None, Some(peripherals)) => Some(peripherals.into()),
+            (Some(health), Some(peripherals)) => Some(
+                column![health, divider(), peripherals]
+                    .spacing(space.sm)
+                    .into(),
+            ),
+        }
     }
 
     pub fn peripheral_indicators<'a>(&self) -> Vec<Element<'a, Message>> {
@@ -267,13 +382,7 @@ impl PowerSettings {
                     SettingsFormat::Icon => {
                         convert::Into::<Element<'a, Message>>::into(icon(p.get_icon_state()))
                     }
-                    SettingsFormat::Percentage => row!(
-                        icon(p.kind.get_icon()),
-                        text(format!("{}%", p.data.capacity))
-                    )
-                    .spacing(space.xxs)
-                    .align_y(Alignment::Center)
-                    .into(),
+                    SettingsFormat::Percentage => text(format!("{}%", p.data.capacity)).into(),
                     SettingsFormat::IconAndPercentage => row!(
                         icon(p.get_icon_state()),
                         text(format!("{}%", p.data.capacity))
@@ -285,6 +394,23 @@ impl PowerSettings {
                     SettingsFormat::IconAndTime => row!(
                         icon(p.get_icon_state()),
                         text(format_time_for_battery(&p.data))
+                    )
+                    .spacing(space.xxs)
+                    .align_y(Alignment::Center)
+                    .into(),
+                    SettingsFormat::Name => text(p.name.to_string()).into(),
+                    SettingsFormat::IconAndName => {
+                        row!(icon(p.get_icon_state()), text(p.name.to_string()))
+                            .spacing(space.xxs)
+                            .align_y(Alignment::Center)
+                            .into()
+                    }
+                    SettingsFormat::PercentageAndTime => {
+                        text(format_percentage_and_time(&p.data)).into()
+                    }
+                    SettingsFormat::IconAndPercentageAndTime => row!(
+                        icon(p.get_icon_state()),
+                        text(format_percentage_and_time(&p.data))
                     )
                     .spacing(space.xxs)
                     .align_y(Alignment::Center)
@@ -329,6 +455,10 @@ impl PowerSettings {
                 let label: String = match self.config.battery_format {
                     SettingsFormat::Time | SettingsFormat::IconAndTime => {
                         format_time_for_battery(&battery)
+                    }
+                    SettingsFormat::PercentageAndTime
+                    | SettingsFormat::IconAndPercentageAndTime => {
+                        format_percentage_and_time(&battery)
                     }
                     _ => format!("{}%", battery.capacity),
                 };
@@ -382,14 +512,18 @@ impl PowerSettings {
             });
 
             match battery.status {
-                BatteryStatus::Charging(remaining) if battery.capacity < 95 => row!(
-                    battery_info,
-                    text(t!(
-                        "settings-power-full-in",
-                        duration = format_duration(&remaining)
-                    ))
-                )
-                .spacing(space.md),
+                BatteryStatus::Charging(remaining)
+                    if battery.capacity < 95 && !remaining.is_zero() =>
+                {
+                    row!(
+                        battery_info,
+                        text(t!(
+                            "settings-power-full-in",
+                            duration = format_duration(&remaining)
+                        ))
+                    )
+                    .spacing(space.md)
+                }
                 BatteryStatus::Discharging(remaining)
                     if battery.capacity < 95 && !remaining.is_zero() =>
                 {
@@ -417,10 +551,13 @@ impl PowerSettings {
                     let charge_limit_enabled = service.charge_limit.as_ref().map(|c| c.enabled);
                     let indicator = self.menu_indicator(battery, None, charge_limit_enabled);
 
-                    let indicator: Element<_> = if !service.peripherals.is_empty() {
+                    // Clickable whenever the battery menu has something to show.
+                    let indicator: Element<_> = if self.shown_health(&battery).is_some()
+                        || !service.peripherals.is_empty()
+                    {
                         styled_button(indicator)
                             .kind(ButtonKind::Solid)
-                            .on_press(Message::TogglePeripheralMenu)
+                            .on_press(Message::ToggleBatteryMenu)
                             .into()
                     } else {
                         indicator
@@ -439,7 +576,7 @@ impl PowerSettings {
                         Some(if service.peripherals.len() > 1 {
                             styled_button(indicator)
                                 .kind(ButtonKind::Solid)
-                                .on_press(Message::TogglePeripheralMenu)
+                                .on_press(Message::ToggleBatteryMenu)
                                 .into()
                         } else {
                             indicator
@@ -496,6 +633,7 @@ impl PowerSettings {
                         Message::TogglePowerProfile,
                         None,
                         None,
+                        None,
                     ),
                     None,
                 ))
@@ -519,6 +657,7 @@ impl PowerSettings {
                         Message::ToggleChargeLimit,
                         None,
                         None,
+                        None,
                     ),
                     None,
                 )
@@ -526,11 +665,46 @@ impl PowerSettings {
         })
     }
 
+    pub fn kbd_backlight_slider<'a>(&'a self) -> Option<Element<'a, Message>> {
+        if !self.config.keyboard_backlight_slider {
+            return None;
+        }
+        let backlight = self.service.as_ref()?.kbd_backlight.as_ref()?;
+        let current = backlight.current.value();
+        Some(
+            slider_control(
+                if current != 0 {
+                    StaticIcon::KeyboardBacklightOn
+                } else {
+                    StaticIcon::KeyboardBacklightOff
+                },
+                0..=backlight.max,
+                current,
+                Message::KbdBacklightChanged,
+                move |delta| {
+                    let y = match delta {
+                        ScrollDelta::Lines { y, .. } => y,
+                        ScrollDelta::Pixels { y, .. } => y,
+                    };
+                    let step = (5 * backlight.max / 100).max(1);
+                    let new = if y > 0.0 {
+                        (current + step).min(backlight.max)
+                    } else {
+                        current.saturating_sub(step)
+                    };
+                    Message::KbdBacklightChanged(remote_value::Message::RequestAndTimeout(new))
+                },
+            )
+            .on_icon_press(Message::ToggleKbdBacklight)
+            .into(),
+        )
+    }
+
     pub fn subscription(&self) -> Subscription<Message> {
         UPowerService::subscribe().map(Message::Event)
     }
 
-    pub fn battery_tooltip_info(&self) -> Option<(u32, String, String)> {
+    pub fn battery_tooltip_info(&self) -> Option<BatteryTooltipInfo> {
         self.service.as_ref().and_then(|service| {
             service.system_battery.map(|battery| {
                 let capacity = battery.capacity as u32;
@@ -541,15 +715,21 @@ impl PowerSettings {
                     BatteryStatus::Unknown => t!("settings-power-status-unknown"),
                     BatteryStatus::Full => t!("settings-power-status-full"),
                 };
-                let details = match battery.status {
-                    BatteryStatus::Charging(_) | BatteryStatus::Discharging(_)
-                        if battery.capacity < 95 =>
-                    {
-                        format_time_for_battery(&battery)
-                    }
-                    _ => String::new(),
+                let details = if battery.capacity < 95 {
+                    battery_time(&battery).unwrap_or_default()
+                } else {
+                    String::new()
                 };
-                (capacity, status_label, details)
+                let health_lines = self
+                    .shown_health(&battery)
+                    .map(|health| health_details(&health))
+                    .unwrap_or_default();
+                BatteryTooltipInfo {
+                    capacity,
+                    status_label,
+                    details,
+                    health_lines,
+                }
             })
         })
     }

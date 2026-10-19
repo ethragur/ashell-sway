@@ -9,7 +9,7 @@ use iced::{
     stream::channel,
 };
 use iwd_dbus::IwdDbus;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::{any::TypeId, ops::Deref, time::Duration};
 use tokio::time::sleep;
 use zbus::zvariant::OwnedObjectPath;
@@ -39,10 +39,14 @@ pub trait NetworkBackend: Send + Sync {
 
     /// Connects to a specific access point, potentially with a password.
     /// Returns the updated list of known connections.
+    ///
+    /// `connect_once` avoids persisting the profile to disk. Backends without
+    /// support ignore it.
     async fn select_access_point(
         &self,
         ap: &AccessPointData,
         password: Option<String>,
+        connect_once: bool,
     ) -> anyhow::Result<()>;
 
     async fn known_connections(&self) -> anyhow::Result<Vec<KnownConnection>>;
@@ -73,6 +77,47 @@ pub enum NetworkEvent {
     ScanRequested(Vec<OwnedObjectPath>),
     ScanCompleted(OwnedObjectPath),
     ScanningNearbyWifi(bool),
+    Psk {
+        ssid: String,
+        outcome: PskOutcome,
+    },
+}
+
+/// The `T:` field of a `WIFI:` URI. SAE stays distinct because WPA3-only
+/// access points reject `T:WPA`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WifiSecurity {
+    Wpa,
+    Sae,
+}
+
+impl WifiSecurity {
+    pub fn qr_auth_type(self) -> &'static str {
+        match self {
+            WifiSecurity::Wpa => "WPA",
+            WifiSecurity::Sae => "SAE",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PskOutcome {
+    Password {
+        psk: String,
+        security: WifiSecurity,
+        /// The QR code needs `H:true` or scanners won't find the network.
+        hidden: bool,
+    },
+    Open {
+        hidden: bool,
+    },
+    /// Secured, but the passphrase isn't readable (agent-owned, not-saved,
+    /// or polkit denied).
+    PasswordUnavailable,
+    /// Enterprise, WEP or OWE: not encodable in a `WIFI:` URI.
+    Unsupported,
+    /// Reading failed; the service logs the cause.
+    Error,
 }
 
 #[derive(Debug, Clone)]
@@ -80,8 +125,13 @@ pub enum NetworkCommand {
     ScanNearByWiFi,
     ToggleWiFi,
     ToggleAirplaneMode,
-    SelectAccessPoint((AccessPointData, Option<String>)),
+    SelectAccessPoint {
+        access_point: AccessPointData,
+        password: Option<String>,
+        connect_once: bool,
+    },
     ToggleVpn(Vpn),
+    ReadPsk(String),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -127,6 +177,16 @@ pub enum KnownConnection {
     Vpn(Vpn),
 }
 
+pub fn frequency_band(frequency_mhz: u32) -> Option<&'static str> {
+    match frequency_mhz {
+        2400..=2500 => Some("2.4 GHz"),
+        4900..=5924 => Some("5 GHz"),
+        5925..=7125 => Some("6 GHz"),
+        57000..=71000 => Some("60 GHz"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ActiveConnectionInfo {
     Wired {
@@ -135,6 +195,7 @@ pub enum ActiveConnectionInfo {
     WiFi {
         name: String,
         strength: u8,
+        frequency: u32,
     },
     Vpn {
         name: String,
@@ -164,6 +225,15 @@ pub struct NetworkData {
     pub scanning_nearby_wifi: bool,
 }
 
+impl NetworkData {
+    /// Whether a saved Wi-Fi profile exists for `ssid`.
+    pub fn is_known_ssid(&self, ssid: &str) -> bool {
+        self.known_connections
+            .iter()
+            .any(|c| matches!(c, KnownConnection::AccessPoint(ap) if ap.ssid == ssid))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NetworkService {
     data: NetworkData,
@@ -180,9 +250,15 @@ impl Deref for NetworkService {
     }
 }
 
+impl NetworkService {
+    pub fn is_network_manager(&self) -> bool {
+        matches!(self.backend_choice, BackendChoice::NetworkManager)
+    }
+}
+
 enum State {
     Init,
-    Active(zbus::Connection, BackendChoice),
+    Active(zbus::Connection, BackendChoice, bool),
     Error,
 }
 
@@ -275,6 +351,7 @@ impl ReadOnlyService for NetworkService {
                 self.data.wireless_access_points = wireless_access_points;
             }
             NetworkEvent::RequestPasswordForSSID(_) => {}
+            NetworkEvent::Psk { .. } => {}
         }
     }
 
@@ -365,18 +442,19 @@ impl NetworkBackend for BackendChoiceWithConnection {
         &self,
         ap: &AccessPointData,
         password: Option<String>,
+        connect_once: bool,
     ) -> anyhow::Result<()> {
         match self.choice {
             BackendChoice::NetworkManager => {
                 NetworkDbus::new(&self.conn)
                     .await?
-                    .select_access_point(ap, password)
+                    .select_access_point(ap, password, connect_once)
                     .await
             }
             BackendChoice::Iwd => {
                 IwdDbus::new(&self.conn)
                     .await?
-                    .select_access_point(ap, password)
+                    .select_access_point(ap, password, connect_once)
                     .await
             }
         }
@@ -413,6 +491,13 @@ impl NetworkBackend for BackendChoiceWithConnection {
 }
 
 impl NetworkService {
+    /// Whether joining `ssid` can skip saving it. Needs backend support and no
+    /// saved profile, since an existing profile is reused as is.
+    /// See <https://github.com/MalpenZibo/ashell/issues/509> for IWD support.
+    pub fn can_connect_once(&self, ssid: &str) -> bool {
+        matches!(self.backend_choice, BackendChoice::NetworkManager) && !self.is_known_ssid(ssid)
+    }
+
     async fn start_listening(state: State, output: &mut Sender<ServiceEvent<Self>>) -> State {
         match state {
             State::Init => match zbus::Connection::system().await {
@@ -460,7 +545,7 @@ impl NetworkService {
                                     pending_scan_devices: Vec::new(),
                                 }))
                                 .await;
-                            State::Active(conn, choice)
+                            State::Active(conn, choice, false)
                         }
                         Err(err) => {
                             if err.is::<zbus::Error>() {
@@ -478,7 +563,7 @@ impl NetworkService {
                     State::Error
                 }
             },
-            State::Active(conn, choice) => {
+            State::Active(conn, choice, refresh_data) => {
                 info!("Listening for network events");
 
                 // TODO: i dont know how to combine the opaque types.. rust streams
@@ -508,7 +593,7 @@ impl NetworkService {
 
                                 debug!("Network service exit events stream");
 
-                                State::Active(conn, choice)
+                                State::Active(conn, choice, false)
                             }
                             Err(err) => {
                                 error!("Failed to listen for network events: {err}");
@@ -527,6 +612,26 @@ impl NetworkService {
                         };
                         match iwd.subscribe_events().await {
                             Ok(mut event_s) => {
+                                if refresh_data {
+                                    match iwd.initialize_data().await {
+                                        Ok(data) => {
+                                            let _ = output
+                                                .send(ServiceEvent::Init(NetworkService {
+                                                    data,
+                                                    conn: conn.clone(),
+                                                    backend_choice: choice,
+                                                    pending_scan_devices: Vec::new(),
+                                                }))
+                                                .await;
+                                        }
+                                        Err(err) => {
+                                            error!(
+                                                "Failed to refresh network service after IWD station topology change: {err}"
+                                            );
+                                        }
+                                    }
+                                }
+
                                 while let Some(events) = event_s.next().await {
                                     for event in events {
                                         // TODO: network manager leaves with device - we can also
@@ -537,8 +642,9 @@ impl NetworkService {
                                 }
 
                                 debug!("Network service exit events stream");
+                                drop(event_s);
 
-                                State::Active(conn, choice)
+                                State::Active(conn, choice, true)
                             }
                             Err(err) => {
                                 error!("Failed to listen for network events: {err}");
@@ -637,11 +743,21 @@ impl Service for NetworkService {
                     |wifi_enabled| ServiceEvent::Update(NetworkEvent::WiFiEnabled(wifi_enabled)),
                 )
             }
-            NetworkCommand::SelectAccessPoint((access_point, password)) => Task::perform(
+            NetworkCommand::SelectAccessPoint {
+                access_point,
+                password,
+                connect_once,
+            } => Task::perform(
                 async move {
-                    bc.select_access_point(&access_point, password)
+                    if let Err(err) = bc
+                        .select_access_point(&access_point, password, connect_once)
                         .await
-                        .unwrap_or_default();
+                    {
+                        error!(
+                            "SelectAccessPoint command: failed to activate '{}': {err}",
+                            access_point.ssid
+                        );
+                    }
                     bc.known_connections().await.unwrap_or_default()
                 },
                 |known_connections| {
@@ -673,6 +789,37 @@ impl Service for NetworkService {
                     },
                 )
             }
+            NetworkCommand::ReadPsk(ssid) => match self.backend_choice {
+                BackendChoice::NetworkManager => {
+                    let conn = self.conn.clone();
+                    Task::perform(
+                        async move {
+                            let result =
+                                async { NetworkDbus::new(&conn).await?.read_psk(&ssid).await }
+                                    .await;
+
+                            let outcome = match result {
+                                Ok(outcome) => outcome,
+                                Err(err) => {
+                                    warn!("read_psk failed for {ssid}: {err}");
+                                    PskOutcome::Error
+                                }
+                            };
+
+                            NetworkEvent::Psk { ssid, outcome }
+                        },
+                        ServiceEvent::Update,
+                    )
+                }
+                BackendChoice::Iwd => {
+                    warn!("ReadPsk command: Wi-Fi sharing requires the NetworkManager backend");
+
+                    Task::done(ServiceEvent::Update(NetworkEvent::Psk {
+                        ssid,
+                        outcome: PskOutcome::Error,
+                    }))
+                }
+            },
         }
     }
 }

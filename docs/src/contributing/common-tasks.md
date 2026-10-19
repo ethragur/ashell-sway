@@ -3,9 +3,9 @@
 ## Adding a New Icon
 
 1. Find the Unicode codepoint from the [Nerd Fonts cheat sheet](https://www.nerdfonts.com/cheat-sheet).
-2. Add it to `src/components/icons.rs`:
+2. Add a variant to the `StaticIcon` enum in `src/components/icons.rs` and map it to its codepoint in `StaticIcon::get_str()`:
    ```rust
-   pub const MY_NEW_ICON: char = '\u{f0001}';
+   StaticIcon::MyNewIcon => "\u{f0001}",
    ```
 3. Build — `build.rs` automatically subsets the font to include the new glyph.
 
@@ -72,9 +72,9 @@ pub fn my_button_style(&self) -> impl Fn(&Theme, Status) -> button::Style {
 ashell uses [Fluent](https://projectfluent.org/) via the `i18n-embed` crate. 
 Catalogs live in `i18n/<lang-tag>/ashell.ftl` and are baked into the binary at compile time with `include_str!`.
 
-1. Copy the seed catalog to a new BCP-47 directory (e.g. `fr-FR`, `de-DE`, `it-IT`):
+1. Copy the seed catalog to a new BCP-47 directory (e.g. `fr-FR`, `de-DE`, `ru-RU`, `uk-UA`, `it-IT`):
    ```bash
-   mkdir -p i18n/fr-FR
+   mkdir -p i18n/<lang-tag>
    cp i18n/en-US/ashell.ftl i18n/<lang-tag>/ashell.ftl
    ```
 
@@ -84,8 +84,24 @@ Catalogs live in `i18n/<lang-tag>/ashell.ftl` and are baked into the binary at c
    - Fluent selector keys: state selectors `[on]/*[off]` and plural selectors like `[one]/*[other]`. 
      The bracketed identifiers are Fluent literals — only the messages on the right-hand side get translated. 
      Use the [CLDR plural categories](https://www.unicode.org/cldr/charts/latest/supplemental/language_plural_rules.html) that apply to your language; `*[other]` is the required default.
+   - A message that takes `{ $count }` may need a plural selector in your language even when the en-US entry has none
+     (e.g. `notifications-group-count`: French needs "1 nouvelle" / "2 nouvelles").
 
-3. Register the catalog in the `CATALOGS` slice in `src/i18n.rs` (keep it alphabetically sorted):
+3. Check the wording against established translations instead of translating each string in isolation.
+   Users of a status bar already know the terms from their desktop, so match them:
+   - **Desktop terms** (power actions, power profiles, battery states, Bluetooth pairing, idle inhibition, system monitor labels):
+     look up the same English string in the GNOME and KDE Plasma translations for your language.
+     GNOME `.po` files are on [l10n.gnome.org](https://l10n.gnome.org/) and in each project's `po/` directory
+     (`gnome-shell`, `gnome-control-center`, `gnome-bluetooth`, `gnome-system-monitor`).
+     KDE catalogs are on [l10n.kde.org](https://l10n.kde.org/), or in your distribution's packages
+     (`powerdevil`, `plasma-workspace`, `bluedevil`, `libksysguard`) as `.mo` files you can turn back into text with `msgunfmt`.
+     Pay attention to term pairs: Suspend and Hibernate must not end up with each other's usual names.
+   - **Weather conditions** (the `weather-*` keys follow the WMO codes used by Open-Meteo):
+     compare with `libgweather` and with the wording of a major weather service or site in your language.
+     Prefer how they phrase intensities ("light", "moderate", "heavy") and "feels like".
+   - If GNOME and KDE disagree, either is fine; say which one you followed in the PR description.
+
+4. Register the catalog in the `CATALOGS` slice in `src/i18n.rs`:
    ```rust
    const CATALOGS: &[(&str, &str)] = &[
        ("en-US", include_str!("../i18n/en-US/ashell.ftl")),
@@ -93,11 +109,11 @@ Catalogs live in `i18n/<lang-tag>/ashell.ftl` and are baked into the binary at c
    ];
    ```
 
-4. Test by setting `language = "<lang-tag>"` in `~/.config/ashell/config.toml`, 
+5. Test by setting `language = "<lang-tag>"` in `~/.config/ashell/config.toml`, 
    or by launching with `LC_MESSAGES=<lang-tag> ./target/release/ashell`. 
    POSIX locale names are normalized to BCP-47 automatically.
 
-5. Run `make check` before pushing.
+6. Run `make check` before pushing.
 
 ## Running Checks Before Committing
 
@@ -107,7 +123,7 @@ Always run the full check before pushing:
 make check
 ```
 
-This runs `cargo fmt`, `cargo check`, and `cargo clippy -- -D warnings`.
+This runs `cargo fmt`, `cargo check --workspace`, and `cargo clippy --workspace -- -D warnings`.
 
 ## Debugging a Specific Module
 
@@ -115,7 +131,8 @@ To see debug output for a specific module:
 
 ```toml
 # In config.toml
-log_level = "warn,ashell::modules::my_module=debug"
+[logging]
+level = "warn,ashell::modules::my_module=debug"
 ```
 
 ## Testing Config Hot-Reload
@@ -123,4 +140,4 @@ log_level = "warn,ashell::modules::my_module=debug"
 1. Start ashell: `make start`
 2. Edit `~/.config/ashell/config.toml` in another terminal
 3. Save — changes should appear immediately
-4. Check logs if changes don't apply: `tail -f $XDG_RUNTIME_DIR/ashell/*.log`
+4. Check logs if changes don't apply: `tail -f $XDG_RUNTIME_DIR/ashell_rCURRENT.log`

@@ -3,16 +3,16 @@ use crate::{
     components::{
         divider, format_indicator,
         icons::{StaticIcon, icon, icon_button},
-        quick_setting_button,
+        quick_setting_button, scrollable,
         spinning_icon::spinning_icon,
-        styled_button,
+        styled_button, toggler,
     },
     config::SettingsFormat,
     services::{
         ReadOnlyService, Service, ServiceEvent,
         network::{
             AccessPointData, ActiveConnectionInfo, KnownConnection, NetworkCommand, NetworkEvent,
-            NetworkService, Vpn, dbus::ConnectivityState,
+            NetworkService, PskOutcome, Vpn, dbus::ConnectivityState, frequency_band,
         },
     },
     t,
@@ -21,7 +21,7 @@ use crate::{
 };
 use iced::{
     Alignment, Element, Length, Padding, Subscription, SurfaceId, Task, Theme,
-    widget::{Column, column, container, row, scrollable, text, toggler},
+    widget::{Column, column, container, row, text},
 };
 use log::{info, warn};
 
@@ -99,7 +99,8 @@ pub enum Message {
     ToggleVPNMenu,
     WifiMenuOpened,
     PasswordDialogConfirmed(String, String),
-    OpenNetworkDialogConfirmed(String),
+    OpenNetworkDialogConfirmed(String, bool),
+    ShareActiveWifi,
     ConfigReloaded(NetworkSettingsConfig),
 }
 
@@ -111,6 +112,7 @@ pub enum Action {
     Command(Task<Message>),
     ToggleWifiMenu,
     ToggleVpnMenu,
+    OpenShareWifiDialog { ssid: String, outcome: PskOutcome },
     CloseSubMenu(Task<Message>),
     CloseMenu(SurfaceId),
 }
@@ -142,12 +144,14 @@ impl NetworkSettingsConfig {
 pub struct NetworkSettings {
     config: NetworkSettingsConfig,
     service: Option<NetworkService>,
+    share_in_flight: bool,
 }
 
 impl NetworkSettings {
     pub fn new(config: NetworkSettingsConfig) -> Self {
         Self {
             config,
+            share_in_flight: false,
             service: None,
         }
     }
@@ -156,23 +160,50 @@ impl NetworkSettings {
         self.service.as_ref().map(|s| s.airplane_mode)
     }
 
+    /// Whether `ssid` can be joined without saving it.
+    pub fn can_connect_once(&self, ssid: &str) -> bool {
+        self.service
+            .as_ref()
+            .is_some_and(|s| s.can_connect_once(ssid))
+    }
+
     pub fn update(&mut self, message: Message) -> Action {
         match message {
             Message::Event(event) => match event {
                 ServiceEvent::Init(service) => {
                     self.service = Some(service);
+                    self.share_in_flight = false;
                     Action::None
                 }
                 ServiceEvent::Update(NetworkEvent::RequestPasswordForSSID(ssid)) => {
                     Action::RequestPasswordForSSID(ssid)
                 }
-                ServiceEvent::Update(data) => {
-                    if let Some(service) = self.service.as_mut() {
-                        service.update(data);
+                ServiceEvent::Update(data) => match data {
+                    NetworkEvent::Psk { ssid, outcome } => {
+                        self.share_in_flight = false;
+                        match self.connected_wifi_label() {
+                            Some(active) if active == ssid => {
+                                Action::OpenShareWifiDialog { ssid, outcome }
+                            }
+                            _ => {
+                                warn!(
+                                    "Discarding PSK for '{ssid}': no longer the active Wi-Fi connection"
+                                );
+                                Action::None
+                            }
+                        }
                     }
+                    other => {
+                        if let Some(service) = self.service.as_mut() {
+                            service.update(other);
+                        }
+                        Action::None
+                    }
+                },
+                ServiceEvent::Error(_) => {
+                    self.share_in_flight = false;
                     Action::None
                 }
-                _ => Action::None,
             },
             Message::ToggleAirplaneMode => match self.service.as_mut() {
                 Some(service) => Action::CloseSubMenu(
@@ -193,7 +224,11 @@ impl NetworkSettings {
             Message::SelectAccessPoint(ac) => match self.service.as_mut() {
                 Some(service) => Action::Command(
                     service
-                        .command(NetworkCommand::SelectAccessPoint((ac, None)))
+                        .command(NetworkCommand::SelectAccessPoint {
+                            access_point: ac,
+                            password: None,
+                            connect_once: false,
+                        })
                         .map(Message::Event),
                 ),
                 _ => Action::None,
@@ -265,7 +300,11 @@ impl NetworkSettings {
                         let password = (!password.is_empty()).then_some(password);
                         Action::Command(
                             service
-                                .command(NetworkCommand::SelectAccessPoint((ap, password)))
+                                .command(NetworkCommand::SelectAccessPoint {
+                                    access_point: ap,
+                                    password,
+                                    connect_once: false,
+                                })
                                 .map(Message::Event),
                         )
                     } else {
@@ -277,31 +316,53 @@ impl NetworkSettings {
                 }
                 _ => Action::None,
             },
-            Message::OpenNetworkDialogConfirmed(ssid) => match self.service.as_mut() {
-                Some(service) => {
-                    let ap = service
-                        .wireless_access_points
-                        .iter()
-                        .find(|ap| ap.ssid == ssid)
-                        .cloned();
-                    if let Some(ap) = ap {
-                        Action::Command(
-                            service
-                                .command(NetworkCommand::SelectAccessPoint((ap, None)))
-                                .map(Message::Event),
-                        )
-                    } else {
-                        warn!(
-                            "Unable to confirm open network dialog: access point '{ssid}' no longer available"
-                        );
-                        Action::None
+            Message::OpenNetworkDialogConfirmed(ssid, connect_once) => {
+                match self.service.as_mut() {
+                    Some(service) => {
+                        let ap = service
+                            .wireless_access_points
+                            .iter()
+                            .find(|ap| ap.ssid == ssid)
+                            .cloned();
+                        if let Some(ap) = ap {
+                            Action::Command(
+                                service
+                                    .command(NetworkCommand::SelectAccessPoint {
+                                        access_point: ap,
+                                        password: None,
+                                        connect_once,
+                                    })
+                                    .map(Message::Event),
+                            )
+                        } else {
+                            warn!(
+                                "Unable to confirm open network dialog: access point '{ssid}' no longer available"
+                            );
+                            Action::None
+                        }
                     }
+                    _ => Action::None,
                 }
-                _ => Action::None,
-            },
+            }
             Message::ConfigReloaded(config) => {
                 self.config = config;
                 Action::None
+            }
+            Message::ShareActiveWifi => {
+                if self.share_in_flight {
+                    return Action::None;
+                }
+                match (self.connected_wifi_label(), self.service.as_mut()) {
+                    (Some(ssid), Some(service)) => {
+                        self.share_in_flight = true;
+                        Action::Command(
+                            service
+                                .command(NetworkCommand::ReadPsk(ssid))
+                                .map(Message::Event),
+                        )
+                    }
+                    _ => Action::None,
+                }
             }
         }
     }
@@ -325,20 +386,28 @@ impl NetworkSettings {
                         _ => None,
                     };
                     let strength_text = strength.map_or("100%".to_string(), |s| format!("{}%", s));
+                    let label = match self.config.indicator_format {
+                        SettingsFormat::Name | SettingsFormat::IconAndName => a.name(),
+                        _ => strength_text,
+                    };
 
                     format_indicator(
                         self.config.indicator_format,
                         icon_type,
-                        text(strength_text).into(),
+                        text(label).into(),
                         state,
                     )
                     .on_right_press(Message::OpenMore)
                     .into()
                 } else {
+                    let label = match self.config.indicator_format {
+                        SettingsFormat::Name | SettingsFormat::IconAndName => "-".to_string(),
+                        _ => "0%".to_string(),
+                    };
                     format_indicator(
                         self.config.indicator_format,
                         StaticIcon::Wifi0,
-                        text("0%").into(),
+                        text(label).into(),
                         IndicatorState::Normal,
                     )
                     .on_right_press(Message::OpenMore)
@@ -376,17 +445,19 @@ impl NetworkSettings {
         self.service.as_ref().and_then(|service| {
             if service.wifi_present {
                 let active_connection = service.active_connections.iter().find_map(|c| match c {
-                    ActiveConnectionInfo::WiFi { name, strength, .. } => {
-                        Some((name, strength, c.get_icon()))
-                    }
+                    ActiveConnectionInfo::WiFi {
+                        name,
+                        strength,
+                        frequency,
+                    } => Some((name, strength, *frequency, c.get_icon())),
                     _ => None,
                 });
 
                 Some((
                     quick_setting_button(
-                        active_connection.map_or_else(|| StaticIcon::Wifi0, |(_, _, icon)| icon),
+                        active_connection.map_or_else(|| StaticIcon::Wifi0, |(_, _, _, icon)| icon),
                         t!("settings-network-wifi"),
-                        active_connection.map(|(name, _, _)| name.to_string()),
+                        active_connection.map(|(name, _, _, _)| name.to_string()),
                         service.wifi_enabled,
                         Message::ToggleWiFi,
                         Some(Message::OpenMore),
@@ -395,14 +466,20 @@ impl NetworkSettings {
                             sub_menu,
                             Message::ToggleWifiMenu,
                         )),
+                        active_connection.and_then(|(_, _, freq, _)| {
+                            frequency_band(freq).map(|b| b.to_string())
+                        }),
                     ),
                     service.wifi_enabled.then_some((
                         sub_menu == Some(SubMenu::Wifi),
                         Self::wifi_menu(
                             service,
                             id,
-                            active_connection.map(|(name, strength, _)| (name.as_str(), *strength)),
+                            active_connection
+                                .map(|(name, strength, _, _)| (name.as_str(), *strength)),
                             self.config.wifi_more_cmd.is_some(),
+                            self.share_in_flight,
+                            service.is_network_manager(),
                         ),
                     )),
                 ))
@@ -471,6 +548,7 @@ impl NetworkSettings {
                             } else {
                                 None
                             },
+                            None,
                         ),
                         Some((
                             sub_menu == Some(SubMenu::Vpn),
@@ -498,6 +576,7 @@ impl NetworkSettings {
                         Message::ToggleAirplaneMode,
                         Some(Message::OpenMore),
                         None,
+                        None,
                     ),
                     None,
                 )
@@ -510,6 +589,8 @@ impl NetworkSettings {
         id: SurfaceId,
         active_connection: Option<(&str, u8)>,
         show_more_button: bool,
+        share_in_flight: bool,
+        can_share_wifi: bool,
     ) -> Element<'a, Message> {
         let (space, font_size, animated) =
             use_theme(|t| (t.space, t.font_size, t.animations_enabled));
@@ -556,31 +637,54 @@ impl NetworkSettings {
                                 )
                             });
 
+                            // Band label goes last so it stays right-aligned on every row.
+                            let mut trailing = row!().spacing(space.xxs).align_y(Alignment::Center);
+
+                            if is_active && can_share_wifi {
+                                trailing = trailing.push(icon_button(StaticIcon::QrCode).on_press_maybe(
+                                    if share_in_flight {
+                                        None
+                                    } else {
+                                        Some(Message::ShareActiveWifi)
+                                    },
+                                ));
+                            }
+
+                            trailing = trailing.extend(frequency_band(ac.frequency).map(|band| {
+                                text(band)
+                                    .size(font_size.xs)
+                                    .style(|theme: &Theme| text::Style {
+                                        color: Some(theme.palette().primary),
+                                    })
+                                    .into()
+                            }));
+
+                            let network_row = row!(
+                                icon(if ac.public {
+                                    ActiveConnectionInfo::get_wifi_icon(ac.strength)
+                                } else {
+                                    ActiveConnectionInfo::get_wifi_lock_icon(ac.strength)
+                                })
+                                .width(Length::Shrink),
+                                text(ac.ssid.as_str()).width(Length::Fill),
+                                trailing,
+                            )
+                            .align_y(Alignment::Center)
+                            .spacing(space.xs);
+
                             styled_button(
                                 Element::from(
-                                    container(
-                                        row!(
-                                            icon(if ac.public {
-                                                ActiveConnectionInfo::get_wifi_icon(ac.strength)
-                                            } else {
-                                                ActiveConnectionInfo::get_wifi_lock_icon(ac.strength)
-                                            })
-                                            .width(Length::Shrink),
-                                            text(ac.ssid.as_str()).width(Length::Fill),
-                                        )
-                                        .align_y(Alignment::Center)
-                                        .spacing(8),
-                                    )
-                                    .style(move |theme: &Theme| {
-                                        container::Style {
-                                            text_color: if is_active {
-                                                Some(theme.palette().success)
-                                            } else {
-                                                None
-                                            },
-                                            ..Default::default()
-                                        }
-                                    }),
+                                    container(network_row)
+                                        .style(move |theme: &Theme| {
+                                            container::Style {
+                                                text_color: if is_active {
+                                                    Some(theme.palette().success)
+                                                } else {
+                                                    None
+                                                },
+                                                ..Default::default()
+                                            }
+                                        }),
                                 ),
                             )
                             .on_press_maybe(if !is_active {
@@ -702,6 +806,15 @@ impl NetworkSettings {
         self.service.as_ref().and_then(|service| {
             service.active_connections.iter().find_map(|c| match c {
                 ActiveConnectionInfo::WiFi { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+        })
+    }
+
+    pub fn connected_wifi_band(&self) -> Option<&'static str> {
+        self.service.as_ref().and_then(|service| {
+            service.active_connections.iter().find_map(|c| match c {
+                ActiveConnectionInfo::WiFi { frequency, .. } => frequency_band(*frequency),
                 _ => None,
             })
         })

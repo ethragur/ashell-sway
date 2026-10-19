@@ -25,14 +25,39 @@ The `expire_timeout` hint sent by applications is respected: a value of `-1` fal
 
 If you prefer no popups and only the panel indicator, set `toast = false`.
 
+### Focusing the app
+
+On Wayland an app cannot bring its own window to the front when you click one of its notifications. So when a click invokes the notification's default action, ashell asks the compositor to focus the app's window: the most recently focused window of the process that sent the notification or, when it has none (Flatpak or XWayland apps), of the app named by the notification's `desktop-entry` hint or app name. The action buttons don't focus it. This works on Hyprland and Niri.
+
+## Do Not Disturb
+
+Do not disturb suppresses toast popups without dropping notifications: they are
+still collected and shown in the menu, and notifications with `Critical`
+urgency still pop up as toasts.
+
+While it is active the bar indicator switches to a crossed-out bell icon.
+
+You can toggle it in three ways:
+
+- **Right-click the notification indicator** in the status bar
+- **The bell button** in the notifications menu header
+- **The "Do Not Disturb" quick setting** in the [Settings](settings.md) menu
+  (can be hidden with `remove_dnd_btn`; it is only shown when this module is
+  part of the bar layout)
+
+The state is not persisted across restarts, ashell always starts with do not
+disturb off.
+
 ## Notification Menu
 
 Click the notification indicator to open the notifications menu. The menu displays all active notifications with the following features:
 
 - **Individual notifications**: Shows the app icon, name, summary, and optional body text and timestamp
 - **Clear button**: Removes all notifications at once
+- **Do not disturb button**: Toggles do not disturb (see above)
 - **Grouped mode** (optional): Organizes notifications by application with expandable groups
-- **Clicking a notification**: Invokes its default action (if provided by the app) and closes it
+- **Clicking a notification**: Invokes its default action (if provided by the app), closes it and the menu
+- **Action buttons**: Any other actions the app provides (for example `notify-send -A "Reply"`) appear as buttons below the notification, on toasts and in the menu. Clicking one invokes that action and closes the notification. This applies to grouped notifications too
 
 ## Configuration
 
@@ -82,9 +107,9 @@ Whether to show transient toast popups when notifications arrive.
 
 ### toast_position
 
-The corner of the screen where toast notifications appear.
+The corner or edge of the screen where toast notifications appear.
 
-**Type:** `string` — one of `"TopLeft"`, `"TopRight"`, `"BottomLeft"`, `"BottomRight"`
+**Type:** `string` — one of `"TopLeft"`, `"TopRight"`, `"TopCenter"`, `"BottomLeft"`, `"BottomRight"`, `"BottomCenter"`
 **Default:** `"TopRight"`
 
 ### toast_timeout
@@ -98,6 +123,8 @@ How long (in milliseconds) a toast is shown before auto-dismissing when the appl
 
 Maximum number of toasts that can be visible at the same time. When this limit is reached, the oldest toast is removed to make room for a new one.
 
+Setting it to `0` suppresses toasts entirely (any visible ones are cleared when the next notification arrives), the same effect as `toast = false`.
+
 **Type:** `integer`
 **Default:** `5`
 
@@ -107,6 +134,15 @@ Maximum height (in pixels) of each individual toast card. Cards with less conten
 
 **Type:** `integer`
 **Default:** `150`
+
+### history_limit
+
+Maximum number of notifications kept in the menu. When a new notification arrives and the history is full, the oldest one is removed and closed, so the app that sent it sees it as expired.
+
+Values outside `1..=1000` are clamped. Notifications still shown as a toast are never removed, so the history can hold more entries than the limit while toasts are on screen.
+
+**Type:** `integer`
+**Default:** `200`
 
 ### blocklist
 
@@ -130,5 +166,6 @@ toast_position = "TopRight"
 toast_timeout = 4000
 toast_limit = 5
 toast_max_height = 150
+history_limit = 200
 blocklist = ["blueman", "^org\\.gnome\\."]
 ```

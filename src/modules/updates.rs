@@ -1,6 +1,7 @@
 use crate::{
     components::divider,
     components::icons::{StaticIcon, icon},
+    components::scrollable,
     components::spinning_icon::spinning_icon,
     components::{IconPosition, MenuSize, styled_button},
     config::UpdatesModuleConfig,
@@ -11,12 +12,14 @@ use iced::{
     Alignment, Element, Length, Padding, Subscription, SurfaceId, Task,
     alignment::Horizontal,
     stream::channel,
-    widget::{Column, column, container, row, scrollable, text},
+    widget::{Column, column, container, row, text},
 };
 use log::error;
 use serde::Deserialize;
-use std::{convert, process::Stdio, time::Duration};
+use std::{process::Stdio, time::Duration};
 use tokio::{process, time::sleep};
+
+const MAX_VERSION_CHARS: usize = 18;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Update {
@@ -78,6 +81,7 @@ pub enum Message {
     ToggleUpdatesList,
     CheckNow,
     Update(SurfaceId),
+    ConfigReloaded(UpdatesModuleConfig),
 }
 
 pub enum Action {
@@ -147,6 +151,11 @@ impl Updates {
                     Message::UpdatesCheckCompleted,
                 ))
             }
+            Message::ConfigReloaded(config) => {
+                self.config = config;
+
+                Action::None
+            }
             Message::Update(id) => {
                 let update_command = self.config.update_cmd.clone();
 
@@ -193,9 +202,7 @@ impl Updates {
         let (space, font_size) = use_theme(|theme| (theme.space, theme.font_size));
         column!(
             if self.updates.is_empty() {
-                convert::Into::<Element<'_, _>>::into(
-                    container(text(t!("updates-up-to-date"))).padding(space.xs),
-                )
+                Element::from(container(text(t!("updates-up-to-date"))).padding(space.xs))
             } else {
                 let mut elements = column!(
                     styled_button(t!("updates-available", count = self.updates.len()))
@@ -226,18 +233,16 @@ impl Updates {
                                                     .width(Length::Fill),
                                                 text(format!(
                                                     "{} -> {}",
-                                                    {
-                                                        let mut res = update.from.clone();
-                                                        res.truncate(18);
-
-                                                        res
-                                                    },
-                                                    {
-                                                        let mut res = update.to.clone();
-                                                        res.truncate(18);
-
-                                                        res
-                                                    },
+                                                    update
+                                                        .from
+                                                        .chars()
+                                                        .take(MAX_VERSION_CHARS)
+                                                        .collect::<String>(),
+                                                    update
+                                                        .to
+                                                        .chars()
+                                                        .take(MAX_VERSION_CHARS)
+                                                        .collect::<String>(),
                                                 ))
                                                 .width(Length::Fill)
                                                 .align_x(Horizontal::Right)

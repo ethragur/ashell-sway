@@ -19,7 +19,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 // source for dbus: https://git.kernel.org/pub/scm/network/wireless/iwd.git/tree/doc
 //info!("{:?}",n.inner().introspect().await?); => can use this to generate proxy implementations
 
-use crate::services::bluetooth::BluetoothService;
+use ashell_services::rfkill;
 
 use zbus::interface;
 
@@ -30,9 +30,9 @@ use iced::futures::stream::select_all;
 use iced::futures::{Stream, StreamExt};
 
 use log::{debug, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
-use tokio::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use zbus::fdo::ObjectManagerProxy;
 use zbus::zvariant::OwnedObjectPath;
 
@@ -97,9 +97,7 @@ impl super::NetworkBackend for IwdDbus<'_> {
         let nm = self;
 
         // airplane mode
-        let bluetooth_soft_blocked = BluetoothService::check_rfkill_soft_block()
-            .await
-            .unwrap_or_default();
+        let bluetooth_soft_blocked = rfkill::bluetooth_soft_blocked().await.unwrap_or_default();
 
         let wifi_present = nm.wifi_device_present().await?;
 
@@ -145,6 +143,12 @@ impl super::NetworkBackend for IwdDbus<'_> {
     /// List known (provisioned) SSIDs.
     async fn known_connections(&self) -> anyhow::Result<Vec<KnownConnection>> {
         let nets = self.reachable_networks().await?;
+        let stations: HashMap<_, _> = self
+            .stations()
+            .await?
+            .into_iter()
+            .map(|s| (s.inner().path().clone(), s))
+            .collect();
         let mut networks = HashMap::<String, AccessPointData>::new();
         for (n, signal_strength) in nets {
             if n.known_network().await.is_err() {
@@ -153,6 +157,31 @@ impl super::NetworkBackend for IwdDbus<'_> {
             let ssid = n.name().await?;
             let path = n.inner().path().clone().into();
             let device_path = n.device().await?.clone();
+
+            let (state, working) = if let Some(station) = stations.get(&device_path) {
+                let station_state = station.state().await.unwrap_or_default();
+                let connected_network = station.connected_network().await.ok();
+
+                let is_connected = connected_network
+                    .map(|net_path| net_path == path)
+                    .unwrap_or(false);
+
+                let state = if is_connected {
+                    match station_state.as_str() {
+                        "connected" => DeviceState::Activated,
+                        "connecting" => DeviceState::Config,
+                        _ => DeviceState::Unknown,
+                    }
+                } else {
+                    DeviceState::Disconnected
+                };
+
+                let working = is_connected && station_state == "connected";
+                (state, working)
+            } else {
+                (DeviceState::Unknown, false)
+            };
+
             let access_point = AccessPointData {
                 ssid: ssid.clone(),
                 path,
@@ -160,9 +189,9 @@ impl super::NetworkBackend for IwdDbus<'_> {
                 strength: map_iwd_rssi_to_percent(signal_strength),
                 max_bitrate: 0,
                 frequency: 0,
-                state: DeviceState::Unknown, // TODO:
+                state,
                 public: n.type_().await? == "open",
-                working: false, // TODO:
+                working,
             };
 
             // maybe IWD will provide frequency and bitrate in the future
@@ -210,7 +239,14 @@ impl super::NetworkBackend for IwdDbus<'_> {
         &self,
         ap: &AccessPointData,
         password: Option<String>,
+        connect_once: bool,
     ) -> anyhow::Result<()> {
+        // IWD has no volatile join; see
+        // https://github.com/MalpenZibo/ashell/issues/509. The UI hides the option here.
+        if connect_once {
+            warn!("Temporary connections are unsupported on the IWD backend, connecting normally");
+        }
+
         // Get the agent manager
         let agent_manager = self.agent_manager().await?;
 
@@ -263,11 +299,7 @@ impl super::NetworkBackend for IwdDbus<'_> {
     }
 
     async fn set_airplane_mode(&self, airplane: bool) -> anyhow::Result<()> {
-        Command::new("/usr/sbin/rfkill")
-            .arg(if airplane { "block" } else { "unblock" })
-            .arg("bluetooth")
-            .output()
-            .await?;
+        rfkill::set_bluetooth_soft_block(airplane).await?;
         self.set_wifi_enabled(!airplane).await?;
         Ok(())
     }
@@ -317,6 +349,8 @@ impl From<String> for IwdStationState {
     }
 }
 
+static NEXT_SIGNAL_AGENT_ID: AtomicU64 = AtomicU64::new(0);
+
 struct SignalAgent {
     tx: tokio::sync::mpsc::UnboundedSender<(OwnedObjectPath, u8)>,
 }
@@ -325,27 +359,60 @@ struct SignalAgentCleanup {
     conn: zbus::Connection,
     station_path: OwnedObjectPath,
     agent_path: OwnedObjectPath,
+    cleaned: bool,
+}
+
+impl SignalAgentCleanup {
+    async fn cleanup(&mut self) {
+        if self.cleaned {
+            return;
+        }
+
+        cleanup_signal_agent(
+            self.conn.clone(),
+            self.station_path.clone(),
+            self.agent_path.clone(),
+        )
+        .await;
+        self.cleaned = true;
+    }
+}
+
+async fn cleanup_signal_agent(
+    conn: zbus::Connection,
+    station_path: OwnedObjectPath,
+    agent_path: OwnedObjectPath,
+) {
+    let station = match StationProxy::builder(&conn)
+        .destination("net.connman.iwd")
+        .and_then(|b| b.path(station_path))
+    {
+        Ok(builder) => builder.build().await.ok(),
+        Err(_) => None,
+    };
+
+    if let Some(station) = station {
+        let _ = station.unregister_signal_level_agent(&agent_path).await;
+    }
+
+    let _ = conn
+        .object_server()
+        .remove::<SignalAgent, _>(&agent_path)
+        .await;
 }
 
 impl Drop for SignalAgentCleanup {
     fn drop(&mut self) {
+        if self.cleaned {
+            return;
+        }
+
         let conn = self.conn.clone();
         let station_path = self.station_path.clone();
         let agent_path = self.agent_path.clone();
 
         tokio::spawn(async move {
-            let station = match StationProxy::builder(&conn)
-                .destination("net.connman.iwd")
-                .and_then(|b| b.path(station_path.clone()))
-            {
-                Ok(builder) => match builder.build().await {
-                    Ok(station) => station,
-                    Err(_) => return,
-                },
-                Err(_) => return,
-            };
-
-            let _ = station.unregister_signal_level_agent(&agent_path).await;
+            cleanup_signal_agent(conn, station_path, agent_path).await;
         });
     }
 }
@@ -475,6 +542,29 @@ impl IwdDbus<'_> {
 
         //self.register_psk_agent().await?;
 
+        // Subscribe before enumerating stations so station additions/removals cannot be missed.
+        let mut station_interface_changes = select_all(vec![
+            self.receive_interfaces_added()
+                .await?
+                .filter_map(|signal| async move {
+                    let args = signal.args().ok()?;
+                    args.interfaces_and_properties()
+                        .contains_key("net.connman.iwd.Station")
+                        .then_some(())
+                })
+                .boxed(),
+            self.receive_interfaces_removed()
+                .await?
+                .filter_map(|signal| async move {
+                    let args = signal.args().ok()?;
+                    args.interfaces()
+                        .iter()
+                        .any(|interface| interface == "net.connman.iwd.Station")
+                        .then_some(())
+                })
+                .boxed(),
+        ]);
+
         // --- WiFi Enabled ---
         let mut wireless_enabled_changes = vec![];
         for adapter_proxy in self.adapters().await? {
@@ -497,6 +587,10 @@ impl IwdDbus<'_> {
 
         // connectivity, access points, strengths and known - all in one
         let stations = self.stations().await?;
+        let initial_station_paths: HashSet<_> = stations
+            .iter()
+            .map(|station| station.inner().path().clone())
+            .collect();
         let mut connectivity_changes = vec![];
         let mut ap_s_kap_changes = vec![];
         let mut signal_level_updates = vec![];
@@ -554,8 +648,7 @@ impl IwdDbus<'_> {
                             debug!("Stopped scanning wifi");
                             events.push(NetworkEvent::ScanningNearbyWifi(false));
                             events.push(NetworkEvent::WirelessDevice {
-                                // TODO: can we reasonably assume this is true here?
-                                wifi_present: iwd.wireless_enabled().await.unwrap_or(false),
+                                wifi_present: iwd.wifi_device_present().await.unwrap_or(false),
                                 wireless_access_points: aps,
                             });
                         }
@@ -577,8 +670,10 @@ impl IwdDbus<'_> {
                 .as_str()
                 .trim_matches('/')
                 .replace('/', "_");
-            let agent_path =
-                OwnedObjectPath::try_from(format!("/com/ashell/signalagent/{station_id}"))?;
+            let agent_id = NEXT_SIGNAL_AGENT_ID.fetch_add(1, Ordering::Relaxed);
+            let agent_path = OwnedObjectPath::try_from(format!(
+                "/com/ashell/signalagent/{station_id}_{agent_id}"
+            ))?;
             let station_for_signal_stream = station.clone();
 
             let server = self
@@ -624,6 +719,13 @@ impl IwdDbus<'_> {
                     .boxed(),
             );
 
+            signal_agent_cleanups.push(SignalAgentCleanup {
+                conn: self.inner().connection().clone(),
+                station_path,
+                agent_path: agent_path.clone(),
+                cleaned: false,
+            });
+
             // Register signal level agent with thresholds aligned to NM's bar ranges
             // NM's bar ranges: >80% (5 bars), >55% (4 bars), >30% (3 bars), >5% (2 bars), ≤5% (1 bar)
             // Using NM linear mapping, this translates to RSSI thresholds:
@@ -632,50 +734,15 @@ impl IwdDbus<'_> {
             station
                 .register_signal_level_agent(&agent_path, &signal_thresholds)
                 .await?;
-
-            signal_agent_cleanups.push(SignalAgentCleanup {
-                conn: self.inner().connection().clone(),
-                station_path,
-                agent_path,
-            });
         }
 
-        // TODO: probably would need to listen to interfaces registered and unregistered
-        //let devices = nm.wireless_devices().await.unwrap_or_default();
-
-        //let wireless_devices_changed = nm
-        //    .receive_devices_changed()
-        //    .await
-        //    .filter_map({
-        //        let conn = conn.clone();
-        //        let devices = devices.clone();
-        //        move |_| {
-        //            let conn = conn.clone();
-        //            let devices = devices.clone();
-        //            async move {
-        //                let nm = NetworkDbus::new(&conn).await.unwrap();
-
-        //                let current_devices = nm.wireless_devices().await.unwrap_or_default();
-        //                if current_devices != devices {
-        //                    let wifi_present = nm.wifi_device_present().await.unwrap_or_default();
-        //                    let wireless_access_points =
-        //                        nm.wireless_access_points().await.unwrap_or_default();
-
-        //                    debug!(
-        //                        "Wireless device changed: wifi present {:?}, wireless_access_points {:?}",
-        //                        wifi_present, wireless_access_points,
-        //                    );
-        //                    Some(NetworkEvent::WirelessDevice {
-        //                        wifi_present,
-        //                        wireless_access_points,
-        //                    })
-        //                } else {
-        //                    None
-        //                }
-        //            }
-        //        }
-        //    })
-        //    .boxed();
+        let current_station_paths: HashSet<_> = self
+            .stations()
+            .await?
+            .into_iter()
+            .map(|station| station.inner().path().clone())
+            .collect();
+        let station_topology_changed = initial_station_paths != current_station_paths;
 
         //TODO: likely need to register an auth agent and wait for it here, same goes for network
         //configuration etc - these all are agents registered with IWD - and represent device
@@ -715,18 +782,30 @@ impl IwdDbus<'_> {
 
         //let access_points = select_all(ac_changes).boxed();
 
+        let station_lifecycle = async move {
+            let topology_changed =
+                station_topology_changed || station_interface_changes.next().await.is_some();
+
+            if topology_changed {
+                debug!("IWD station topology changed; restarting listeners");
+            }
+
+            for cleanup in &mut signal_agent_cleanups {
+                cleanup.cleanup().await;
+            }
+        };
+
         let events = select_all(vec![
             select_all(wireless_enabled_changes).boxed(),
             select_all(connectivity_changes).boxed(),
             select_all(ap_s_kap_changes).boxed(),
             select_all(signal_level_updates).boxed(),
+            iced::futures::stream::pending().boxed(),
             // TODO: add a future that waits for 10s to poll certain information like the signal
             // strength change
         ])
-        .map(move |event| {
-            let _keep_alive = &signal_agent_cleanups;
-            event
-        });
+        .take_until(station_lifecycle)
+        .boxed();
 
         Ok(events)
     }
@@ -743,14 +822,7 @@ impl IwdDbus<'_> {
 
     /// Return true if any device in station mode is present.
     pub async fn wifi_device_present(&self) -> anyhow::Result<bool> {
-        let devices = self.wireless_devices().await?;
-
-        for d in devices {
-            if d.powered().await? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(!self.wireless_devices().await?.is_empty())
     }
 
     /// List all networks currently connected (Connected = true).
@@ -776,6 +848,7 @@ impl IwdDbus<'_> {
             info.push(ActiveConnectionInfo::WiFi {
                 name: ssid,
                 strength: map_iwd_rssi_to_percent(signal_strength),
+                frequency: 0,
             });
         }
         Ok(info)
