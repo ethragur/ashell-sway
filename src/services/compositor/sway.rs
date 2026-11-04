@@ -154,6 +154,7 @@ async fn fetch_full_state() -> Result<CompositorState> {
                 windows: 0,
                 is_special: false,
                 has_urgent: w.urgent,
+                window_classes: Vec::new(),
             }
         })
         .collect();
@@ -173,10 +174,10 @@ async fn fetch_full_state() -> Result<CompositorState> {
 
     // Fix: removed the broken `?` inside a bool-returning closure.
     // Find the focused output, then look up its active workspace num.
-    let active_workspace_id = outputs_sorted
+    let active_workspace_ids: Vec<i32> = outputs_sorted
         .iter()
-        .find(|o| o.focused)
-        .and_then(|o| output_to_active_ws.get(&o.name).copied());
+        .filter_map(|o| output_to_active_ws.get(&o.name).copied())
+        .collect();
 
     let keyboard_layout = inputs
         .iter()
@@ -187,7 +188,7 @@ async fn fetch_full_state() -> Result<CompositorState> {
     Ok(CompositorState {
         workspaces: workspace_list,
         monitors,
-        active_workspace_id,
+        active_workspace_ids,
         active_window,
         keyboard_layout,
         submap: None,
