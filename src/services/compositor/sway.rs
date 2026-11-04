@@ -14,23 +14,37 @@ pub async fn execute_command(cmd: CompositorCommand) -> Result<()> {
     let mut conn = Connection::new().await?;
 
     let command = match cmd {
-        CompositorCommand::FocusWorkspace(id) => format!("workspace number {id}"),
+        CompositorCommand::FocusWorkspace(id) => {
+            format!("workspace number {id}")
+        }
+
+        CompositorCommand::FocusNamedWorkspace(name) => {
+            format!("workspace {name}")
+        }
+
+        CompositorCommand::FocusAppWindow { .. } => {
+            return Err(anyhow!("FocusAppWindow is not supported on Sway"));
+        }
+
         CompositorCommand::FocusSpecialWorkspace(_) => {
             return Err(anyhow!("Special workspaces not supported on Sway"));
         }
+
         CompositorCommand::ToggleSpecialWorkspace(_) => {
             return Err(anyhow!("Special workspaces not supported on Sway"));
         }
+
         CompositorCommand::FocusMonitor(id) => {
-            // Fix: get_outputs() is a method on Connection, not a free function
             let outputs = conn.get_outputs().await?;
             let name = outputs
                 .get(id as usize)
                 .ok_or_else(|| anyhow!("Output index {} out of range", id))?
                 .name
                 .clone();
+
             format!("focus output {name}")
         }
+
         CompositorCommand::ScrollWorkspace(dir) => {
             if dir > 0 {
                 "workspace next"
@@ -39,7 +53,9 @@ pub async fn execute_command(cmd: CompositorCommand) -> Result<()> {
             }
             .to_string()
         }
+
         CompositorCommand::NextLayout => "input toggle_keymap".to_string(),
+
         CompositorCommand::CustomDispatch(_, args) => format!("exec {args}"),
     };
 
